@@ -11,6 +11,25 @@
 ============================================================
 """
 
+import os
+import sys
+
+# --- 自动检测并设置 JAVA_HOME ---
+_JAVA_PATHS = [
+    r"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot",
+    r"C:\Program Files\Java\jdk-17",
+    r"C:\Program Files\Java\jdk-11",
+    r"C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot",
+]
+if "JAVA_HOME" not in os.environ:
+    for _p in _JAVA_PATHS:
+        if os.path.isdir(_p):
+            os.environ["JAVA_HOME"] = _p
+            print(f"[INFO] 自动设置 JAVA_HOME = {_p}")
+            break
+    else:
+        sys.exit("错误: 未找到Java，请安装JDK 17并设置JAVA_HOME环境变量")
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, count, countDistinct, sum as spark_sum, avg, stddev,
@@ -655,17 +674,18 @@ def select_final_features(daily_df):
 
 
 def save_engineered_data(final_df, output_path="feature_engineering_output"):
-    """保存特征工程结果"""
+    """保存特征工程结果（使用Pandas写CSV，避免Hadoop依赖）"""
     print("\n" + "=" * 60)
     print("Step 11: 保存特征工程结果")
     print("=" * 60)
 
-    # 保存为CSV
-    final_df.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .csv(f"{output_path}/engineered_features")
+    import os as _os
+    _os.makedirs(output_path, exist_ok=True)
 
-    print(f"  特征工程数据已保存至: {output_path}/engineered_features")
+    csv_path = f"{output_path}/engineered_features.csv"
+    pdf = final_df.toPandas()
+    pdf.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"  特征工程数据已保存至: {csv_path} ({len(pdf)} 行 x {len(pdf.columns)} 列)")
 
     # 简单统计摘要
     print(f"\n  最终数据集概况:")

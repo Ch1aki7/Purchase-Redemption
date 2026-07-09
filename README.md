@@ -93,30 +93,38 @@
 ┌─────────────────────────────────────────────────┐
 │                                                 │
 │  01_data_exploration.py                         │
+│  ├─ 自动检测 JAVA_HOME                           │
 │  ├─ 读取4张原始表                                │
 │  ├─ Schema & 基础统计                            │
 │  ├─ 缺失值 & 日期对齐检查                         │
-│  └─ 输出：每日聚合CSV                            │
+│  └─ 输出：exploration_output/daily_aggregation.csv│
 │              │                                   │
 │              ▼                                   │
 │  02_feature_engineering.py                      │
+│  ├─ 自动检测 JAVA_HOME                           │
 │  ├─ 每日聚合（用户级 → 每日级）                    │
 │  ├─ 合并收益率表 + Shibor表                       │
 │  ├─ 时间特征 + 滞后特征 + 滚动窗口特征              │
 │  ├─ 趋势特征 + 收益率/Shibor衍生特征               │
 │  ├─ 用户画像聚合特征                              │
-│  └─ 输出：engineered_features.csv                │
+│  └─ 输出：feature_engineering_output/             │
+│          engineered_features.csv                  │
 │              │                                   │
 │              ▼                                   │
 │  03_train_data_prepare.py                       │
+│  ├─ 自动检测 JAVA_HOME                           │
 │  ├─ 从原始数据一站式构建（可独立运行）              │
 │  ├─ 划分训练集/验证集                             │
 │  ├─ VectorAssembler + StandardScaler             │
 │  ├─ 特征相关性分析                                │
-│  └─ 输出：train/val/scaled CSV                   │
+│  └─ 输出：modeling_output/                        │
+│          train_data.csv, val_data.csv,            │
+│          train_scaled.csv, val_scaled.csv         │
 │                                                 │
 └─────────────────────────────────────────────────┘
 ```
+
+> 每个脚本启动时会**自动检测并设置 JAVA_HOME**（支持 `C:\Program Files\Microsoft\jdk-17.*` 等常见路径），无需用户手动配置。
 
 ---
 
@@ -143,17 +151,22 @@
 
 ```
 exploration_output/
-└── daily_aggregation/
-    └── part-*.csv     # 每日聚合统计：active_users, total_purchase,
-                       #   total_redeem, total_share, total_consume 等
+└── daily_aggregation.csv    # 427行每日聚合统计：active_users, total_purchase,
+                             #   total_redeem, total_share, total_consume 等
 ```
 
-### 预期分析结论
+### 运行验证结果（本地实测）
 
-- 数据时间跨度：2013-07-01 ~ 2014-08-31（约14个月）
-- 训练用户约28,000人，测试集另有部分9月首次出现用户
-- 余额数据一致性：`tBalance = yBalance + total_purchase_amt - total_redeem_amt`
-- 消费类目在 `consume_amt=0` 时为空，符合数据说明
+| 项目 | 数值 |
+|------|------|
+| 用户总数 | 28,041 |
+| 交易记录 | 2,840,421 行 |
+| 日期范围 | 2013-07-01 ~ 2014-08-31（427天） |
+| 收益率日期 | 427天（全覆盖） |
+| Shibor日期 | 294天（周末/节假日缺失，脚本自动前向填充） |
+| 性别分布 | 男 51.7% / 女 48.3% |
+| consume_amt=0 比例 | 93.88%（category字段NULL原因） |
+| 耗时 | ~75秒 |
 
 ---
 
@@ -236,8 +249,7 @@ exploration_output/
 
 ```
 feature_engineering_output/
-└── engineered_features/
-    └── part-*.csv     # 完整的特征工程数据集
+└── engineered_features.csv    # 完整特征工程数据集（~427行 × 150+列）
 ```
 
 ---
@@ -287,51 +299,108 @@ feature_engineering_output/
 
 ```
 modeling_output/
-├── train_data/        # 训练集（原始特征，含所有列）
-├── val_data/          # 验证集（原始特征，含所有列）
-├── train_scaled/      # 训练集（仅report_date + 目标 + features_scaled）
-└── val_scaled/        # 验证集（仅report_date + 目标 + features_scaled）
+├── train_data.csv          # 训练集（原始特征，含所有列）
+├── val_data.csv            # 验证集（原始特征，含所有列）
+├── train_scaled.csv        # 训练集标准化版（仅report_date + 目标 + features_scaled）
+└── val_scaled.csv          # 验证集标准化版（仅report_date + 目标 + features_scaled）
 ```
 
 ---
 
 ## 7. 运行方式
 
-### 环境要求
+### 7.1 环境要求
 
-- Python 3.x
-- PySpark 2.4+ / 3.x
-- 数据目录 `Purchase Redemption Data/` 下的所有CSV文件
+| 组件 | 版本 | 说明 |
+|------|------|------|
+| Python | 3.x | 已验证 3.13.3 |
+| Java JDK | 17 LTS | PySpark 依赖 JVM，推荐 Microsoft OpenJDK 17 |
+| PySpark | 4.x | `pip install pyspark` |
+| Pandas | 2.x | `pip install pandas`（用于 CSV 输出） |
 
-### 按顺序运行
+### 7.2 一键环境搭建
 
-```bash
-# Step 1: 数据探索（可选，了解数据概况）
-spark-submit 01_data_exploration.py
+```powershell
+# 1. 安装 Java 17（Windows，需管理员权限）
+winget install Microsoft.OpenJDK.17
 
-# Step 2: 特征工程（输出完整的特征数据集）
-spark-submit 02_feature_engineering.py
+# 2. 安装 Python 依赖
+pip install pyspark pandas
+
+# 3. 验证环境
+python -c "from pyspark.sql import SparkSession; print('OK')"
+```
+
+> **注意**：步骤1安装完成后需**重新打开终端**使环境变量生效。
+> 如果未重启终端，脚本会自动在常见路径下搜索 JDK 并设置 `JAVA_HOME`。
+
+### 7.3 运行脚本
+
+```powershell
+# 进入项目目录
+cd D:\Daily\BD
+
+# Step 1: 数据探索（可选，了解数据概况，~75秒）
+python 01_data_exploration.py
+
+# Step 2: 特征工程（输出完整特征数据集）
+python 02_feature_engineering.py
 
 # Step 3: 训练数据准备（可独立运行，不依赖Step 2）
-spark-submit 03_train_data_prepare.py
+python 03_train_data_prepare.py
 ```
 
-### 在 Jupyter/交互式环境中
+> 三个脚本都会在启动时打印 `[INFO] 自动设置 JAVA_HOME = ...` 确认 Java 已就绪。
+
+### 7.4 JAVA_HOME 自动检测机制
+
+每个脚本开头内置了以下逻辑，无需用户手动设置环境变量：
 
 ```python
-# 也可以直接在notebook中调用核心函数
-from pyspark.sql import SparkSession
-spark = SparkSession.builder.appName("test").getOrCreate()
-
-# 方式1：导入脚本中的函数
-import importlib.util
-spec = importlib.util.spec_from_file_location("fe", "02_feature_engineering.py")
-fe = importlib.util.module_from_spec(spec)
-
-# 方式2：复制关键函数到notebook中运行
+_JAVA_PATHS = [
+    r"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot",
+    r"C:\Program Files\Java\jdk-17",
+    r"C:\Program Files\Java\jdk-11",
+    r"C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot",
+]
+if "JAVA_HOME" not in os.environ:
+    for p in _JAVA_PATHS:
+        if os.path.isdir(p):
+            os.environ["JAVA_HOME"] = p
+            break
 ```
 
-### 关键Spark配置
+如果你的 JDK 安装在其他路径，可以：
+- 设置系统环境变量 `JAVA_HOME`（推荐）
+- 或修改脚本中的 `_JAVA_PATHS` 列表
+
+### 7.5 CSV 输出说明
+
+由于 Windows 环境下 PySpark 写入本地 CSV 需要 Hadoop 的 `winutils.exe`，脚本改用 **Pandas 写 CSV** 的方式：`DataFrame.toPandas().to_csv()`。
+
+| 优点 | 说明 |
+|------|------|
+| 无需 Hadoop | 不需要配置 `HADOOP_HOME` 和 `winutils.exe` |
+| 单文件输出 | 直接输出一个 csv 文件，而非 Spark 的 `part-*.csv` 目录 |
+| UTF-8 BOM | 使用 `utf-8-sig` 编码，Excel 可直接打开不乱码 |
+
+### 7.6 在 Jupyter/交互式环境中
+
+```python
+# 在notebook中直接运行
+import os
+os.environ["JAVA_HOME"] = r"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot"
+
+from pyspark.sql import SparkSession
+spark = SparkSession.builder \
+    .appName("test") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+# 然后复制脚本中的核心函数到notebook中运行
+```
+
+### 7.7 关键Spark配置
 
 脚本中已内置以下优化配置：
 
@@ -399,12 +468,21 @@ fe = importlib.util.module_from_spec(spec)
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| 收益率/Shibor缺失值 | 交易日历不同（非交易日无Shibor数据） | 脚本已做前向填充 |
+| `JAVA_HOME is not set` | PySpark需要Java运行环境 | 安装JDK 17：`winget install Microsoft.OpenJDK.17`，脚本内置了自动检测 |
+| `HADOOP_HOME and hadoop.home.dir are unset` | Windows缺少Hadoop的winutils | 脚本已改用Pandas写CSV来规避此问题 |
+| `No module named 'pandas'` | 缺少Pandas | `pip install pandas`（脚本用Pandas输出CSV） |
+| 收益率/Shibor缺失值 | 非交易日无Shibor数据（周末） | 脚本已做前向填充 |
 | 滞后特征前期缺失 | 数据开始的前30天没有足够的滞后历史 | 脚本已填充为0 |
-| category字段大量NULL | consume_amt=0时类目为空 | 符合预期，非数据问题 |
+| category字段大量NULL（93.88%） | consume_amt=0时类目为空 | 符合数据说明，非Bug |
 | 内存不足 | 2.8M行数据 + 大量窗口计算 | 增大executor内存，或分批处理 |
 
-### 9.4 提交格式
+### 9.4 架构设计说明
+
+**为什么输出用 Pandas 而非 Spark 原生写入？**
+
+在 Windows 上，PySpark 的 `DataFrame.write.csv()` 底层依赖 Hadoop 的 `FileOutputCommitter`，而后者需要 `winutils.exe`（Hadoop 的 Windows 兼容层）。配置 `HADOOP_HOME` + `winutils.exe` 比较繁琐，由于聚合后的数据量很小（427行），使用 `.toPandas().to_csv()` 绕过此限制，效果相同且更简洁。
+
+### 9.5 提交格式
 
 最终提交文件为 `tc_comp_predict_table.csv`：
 

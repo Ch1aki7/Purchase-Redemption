@@ -7,6 +7,25 @@
 ============================================================
 """
 
+import os
+import sys
+
+# --- 自动检测并设置 JAVA_HOME ---
+_JAVA_PATHS = [
+    r"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot",
+    r"C:\Program Files\Java\jdk-17",
+    r"C:\Program Files\Java\jdk-11",
+    r"C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot",
+]
+if "JAVA_HOME" not in os.environ:
+    for _p in _JAVA_PATHS:
+        if os.path.isdir(_p):
+            os.environ["JAVA_HOME"] = _p
+            print(f"[INFO] 自动设置 JAVA_HOME = {_p}")
+            break
+    else:
+        sys.exit("错误: 未找到Java，请安装JDK 17并设置JAVA_HOME环境变量")
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, count, countDistinct, sum as spark_sum, avg, min as spark_min,
@@ -266,12 +285,15 @@ def check_missing_values(tables):
 
 
 def save_exploration_results(tables, output_dir="exploration_output"):
-    """保存探索结果"""
+    """保存探索结果（使用Pandas写CSV，避免Hadoop依赖）"""
     print("\n" + "=" * 60)
     print("8. 保存每日聚合结果")
     print("=" * 60)
 
-    # 每日聚合统计
+    import os as _os
+    _os.makedirs(output_dir, exist_ok=True)
+
+    # 每日聚合统计（转为Pandas写CSV）
     daily_agg = tables["user_balance"].groupBy("report_date").agg(
         countDistinct("user_id").alias("active_users"),
         spark_sum("total_purchase_amt").alias("total_purchase"),
@@ -292,10 +314,10 @@ def save_exploration_results(tables, output_dir="exploration_output"):
         avg("yBalance").alias("avg_yesterday_balance")
     ).orderBy("report_date")
 
-    daily_agg_path = f"{output_dir}/daily_aggregation"
-    daily_agg.coalesce(1).write.mode("overwrite") \
-        .option("header", "true").csv(daily_agg_path)
-    print(f"  每日聚合结果已保存至: {daily_agg_path}")
+    daily_agg_path = f"{output_dir}/daily_aggregation.csv"
+    pdf = daily_agg.toPandas()
+    pdf.to_csv(daily_agg_path, index=False, encoding="utf-8-sig")
+    print(f"  每日聚合结果已保存至: {daily_agg_path} ({len(pdf)} 行)")
 
     # 保存各表的描述性统计
     print("\n  探索完成！")

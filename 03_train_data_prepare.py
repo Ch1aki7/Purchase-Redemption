@@ -12,6 +12,25 @@
 ============================================================
 """
 
+import os
+import sys
+
+# --- 自动检测并设置 JAVA_HOME ---
+_JAVA_PATHS = [
+    r"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot",
+    r"C:\Program Files\Java\jdk-17",
+    r"C:\Program Files\Java\jdk-11",
+    r"C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot",
+]
+if "JAVA_HOME" not in os.environ:
+    for _p in _JAVA_PATHS:
+        if os.path.isdir(_p):
+            os.environ["JAVA_HOME"] = _p
+            print(f"[INFO] 自动设置 JAVA_HOME = {_p}")
+            break
+    else:
+        sys.exit("错误: 未找到Java，请安装JDK 17并设置JAVA_HOME环境变量")
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, count, mean, stddev, min as spark_min, max as spark_max,
@@ -545,31 +564,34 @@ def prepare_prediction_template(spark):
 def save_datasets(train_df, val_df, train_scaled, val_scaled,
                   feature_cols, output_path="modeling_output"):
     """
-    保存处理后的数据集
+    保存处理后的数据集（使用Pandas写CSV，避免Hadoop依赖）
     """
+    import os as _os
+    _os.makedirs(output_path, exist_ok=True)
+
     print("\n" + "=" * 60)
     print("Step 8: 保存数据集")
     print("=" * 60)
 
-    # 原始特征数据集（用于tree-based模型如GBDT，不需要标准化）
+    # 原始特征数据（用于tree-based模型如GBDT）
     print("  保存原始特征数据...")
-    train_df.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .csv(f"{output_path}/train_data")
+    train_pdf = train_df.toPandas()
+    train_pdf.to_csv(f"{output_path}/train_data.csv", index=False, encoding="utf-8-sig")
+    print(f"    训练集: {len(train_pdf)} 行 x {len(train_pdf.columns)} 列")
 
-    val_df.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .csv(f"{output_path}/val_data")
+    val_pdf = val_df.toPandas()
+    val_pdf.to_csv(f"{output_path}/val_data.csv", index=False, encoding="utf-8-sig")
+    print(f"    验证集: {len(val_pdf)} 行 x {len(val_pdf.columns)} 列")
 
-    # 标准化后的数据集（用于线性模型如Ridge, 或神经网络）
+    # 标准化后的数据（用于线性模型如Ridge，或神经网络）
     print("  保存标准化数据...")
-    train_scaled.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .csv(f"{output_path}/train_scaled")
+    train_s_pdf = train_scaled.toPandas()
+    train_s_pdf.to_csv(f"{output_path}/train_scaled.csv", index=False, encoding="utf-8-sig")
+    print(f"    训练集(标准化): {len(train_s_pdf)} 行")
 
-    val_scaled.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .csv(f"{output_path}/val_scaled")
+    val_s_pdf = val_scaled.toPandas()
+    val_s_pdf.to_csv(f"{output_path}/val_scaled.csv", index=False, encoding="utf-8-sig")
+    print(f"    验证集(标准化): {len(val_s_pdf)} 行")
 
     print(f"  数据已保存至: {output_path}/")
 
