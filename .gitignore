@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Raw Tianchi data: keep only README in this directory
+Purchase Redemption Data/*
+!Purchase Redemption Data/README.txt
+*.xlsx
+*.xls
+
+# Generated outputs: keep only README placeholders
+output/*
+!output/README.txt
+models/*
+!models/README.txt
+
+# Local archives and large data packages
+*.zip
+*.rar
+*.7z
+
+# Streamlit local config
+.streamlit/secrets.toml
