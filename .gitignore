@@ -1,3 +1,10 @@
 /Purchase Redemption Data
 
 /exploration_output
+
+/feature_engineering_output
+
+/modeling_output
+
+/data/*.db
+/_spark_checkpoint

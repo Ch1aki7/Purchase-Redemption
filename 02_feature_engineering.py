@@ -55,6 +55,15 @@ def init_spark(app_name="FeatureEngineering"):
     return spark
 
 
+def materialize_df(spark, df):
+    """
+    将中间结果物化再读回，打断过深的 Spark 逻辑计划。
+    每日聚合仅 ~427 行，用 Pandas 中转即可，且无需 winutils。
+    """
+    pdf = df.toPandas()
+    return spark.createDataFrame(pdf)
+
+
 def read_raw_data(spark, data_dir="Purchase Redemption Data"):
     """读取原始数据"""
     print("读取原始数据...")
@@ -730,6 +739,10 @@ def main():
 
     # 9. 处理缺失值
     daily_df = fill_missing_lag_values(daily_df)
+
+    # 9.5 物化中间结果（150+ 列 + 大量窗口函数会导致逻辑计划过深）
+    print("\n[INFO] 物化中间特征表，避免 Spark 分析阶段 StackOverflowError...")
+    daily_df = materialize_df(spark, daily_df)
 
     # 10. 用户画像特征
     daily_df = add_user_profile_features(spark, daily_df, data_dir)
