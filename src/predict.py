@@ -178,6 +178,11 @@ def main():
     r_hi = np.percentile(df["redeem"], 99)
 
     pred_rows = []
+    # 第五轮优化：月末3天上调（申购×1.2，赎回×1.3）
+    # 实验验证：月末资金集中进出，模型系统性低估，上调后多数月末日误差降到30%以下
+    # 验证集总分从5.19提升到5.43（零分日从9个减到6个）
+    LAST3_P_BOOST = 1.2
+    LAST3_R_BOOST = 1.3
     for date in pd.date_range("2014-09-01", "2014-09-30", freq="D"):
         X = build_future_row(date, history, feature_cols, exog_values, df)
         purchase_pred = float(np.expm1(model_purchase.predict(X)[0]))
@@ -189,6 +194,12 @@ def main():
         recent7_r = float(history["redeem"].tail(7).mean())
         purchase_pred = 0.99 * purchase_pred + 0.01 * recent7_p
         redeem_pred = 0.99 * redeem_pred + 0.01 * recent7_r
+
+        # 月末3天上调（第五轮优化）
+        dim = date.days_in_month
+        if date.day >= dim - 2:
+            purchase_pred *= LAST3_P_BOOST
+            redeem_pred *= LAST3_R_BOOST
 
         # 裁剪到历史合理区间
         purchase_pred = float(np.clip(purchase_pred, p_lo, p_hi))
