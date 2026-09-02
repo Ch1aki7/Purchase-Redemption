@@ -15,11 +15,11 @@ from .evaluate import evaluate_prediction
 
 
 def build_lightgbm():
-    """LightGBM 调参版：更多树 + 早停 + 正则化。"""
+    """LightGBM 调参版：更多树 + 早停 + 正则化（调参实验最优配置）。"""
     from lightgbm import LGBMRegressor
     return LGBMRegressor(
-        n_estimators=3000,
-        learning_rate=0.005,
+        n_estimators=5000,
+        learning_rate=0.003,
         num_leaves=31,
         max_depth=-1,
         min_child_samples=5,
@@ -30,6 +30,7 @@ def build_lightgbm():
         reg_lambda=0.05,
         random_state=42,
         n_jobs=-1,
+        verbose=-1,
     )
 
 
@@ -68,7 +69,7 @@ def fit_single_model(model, X_train, y_train, X_valid=None, y_valid=None, use_ea
                 X_train, y_train,
                 eval_set=[(X_valid, y_valid)],
                 callbacks=[
-                    __import__("lightgbm").early_stopping(stopping_rounds=100),
+                    __import__("lightgbm").early_stopping(stopping_rounds=100, verbose=False),
                     __import__("lightgbm").log_evaluation(period=0),
                 ],
             )
@@ -139,11 +140,11 @@ def main():
 
     # 训练集成模型
     print("训练申购集成模型...")
-    model_purchase = EnsembleModel(lgb_weight=0.85, rf_weight=0.15)
+    model_purchase = EnsembleModel(lgb_weight=0.95, rf_weight=0.05)
     model_purchase.fit(X_train, y_purchase_train, X_valid, y_purchase_valid)
 
     print("训练赎回集成模型...")
-    model_redeem = EnsembleModel(lgb_weight=0.85, rf_weight=0.15)
+    model_redeem = EnsembleModel(lgb_weight=0.95, rf_weight=0.05)
     model_redeem.fit(X_train, y_redeem_train, X_valid, y_redeem_valid)
 
     # 验证集预测
