@@ -38,9 +38,8 @@ Purchase-Redemption/
 │   └── README.txt                         # 运行后生成预测和验证结果
 ├── models/
 │   └── README.txt                         # 运行后保存模型文件
-├── legacy_original_project/               # 你原本项目中的脚本和说明归档
+├── Purchase Redemption Data.zip           # 原始数据压缩包（备份，不提交 Git）
 ├── 项目二_需求分析与最小方案.md
-├── 项目二_需求分析与最小方案_目录更新版.pdf
 └── .gitignore
 ```
 
@@ -161,17 +160,11 @@ git push -u origin main
 
 ## 九、原项目文件说明
 
-`legacy_original_project/` 中保留了你原本项目里的脚本和文档，便于查阅：
-
-- `01_data_exploration.py`
-- `02_feature_engineering.py`
-- `03_train_data_prepare.py`
-- `README_original.md`
-- 部分原项目输出结果
-
 当前推荐运行主流程为：
 
 ```bash
 python run_all.py
 streamlit run app.py
 ```
+
+项目已集成端到端流程：数据预处理 → 特征工程 → LightGBM+RandomForest 集成训练 → 滚动预测 → 可视化展示。验证集模拟总分约 8.05 分（满分 10）。

@@ -34,3 +34,18 @@ models/*
 
 # Streamlit local config
 .streamlit/secrets.toml
+
+# CodeFlicker / MyFlicker IDE artifacts
+.codeflicker/
+codeflicker/
+myflicker/
+.cfsession
+.cfstate
+*.canvas.tsx
+
+# AI assistant memory bank
+mem-bank/
+
+# Plan and thread artifacts (auto-generated)
+plan/
+*.plan.md

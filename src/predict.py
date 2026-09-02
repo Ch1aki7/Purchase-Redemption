@@ -20,22 +20,111 @@ def date_features(date):
         "is_weekend": int(date.dayofweek in [5, 6]),
         "is_month_start": int(date.is_month_start),
         "is_month_end": int(date.is_month_end),
+        # 周期连续编码
+        "dayofweek_sin": np.sin(2 * np.pi * date.dayofweek / 7),
+        "dayofweek_cos": np.cos(2 * np.pi * date.dayofweek / 7),
+        "dayofmonth_sin": np.sin(2 * np.pi * date.day / 31),
+        "dayofmonth_cos": np.cos(2 * np.pi * date.day / 31),
+        "month_sin": np.sin(2 * np.pi * date.month / 12),
+        "month_cos": np.cos(2 * np.pi * date.month / 12),
     }
 
 
-def build_future_row(date, history, feature_cols, exog_values):
+def month_start_end_features(date, history):
+    """月初/月末连续特征（与 preprocess.py 对齐）。"""
+    days_in_month = date.days_in_month
+    days_to_start = date.day - 1
+    days_to_end = days_in_month - date.day
+    # 月初历史均值（最近30天均值，用 history 计算）
+    p_vals = history["purchase"].astype(float).tolist()
+    r_vals = history["redeem"].astype(float).tolist()
+    p_start_mean = float(np.mean(p_vals[-30:])) if len(p_vals) >= 30 else float(np.mean(p_vals))
+    r_start_mean = float(np.mean(r_vals[-30:])) if len(r_vals) >= 30 else float(np.mean(r_vals))
+    return {
+        "days_to_month_start": days_to_start,
+        "days_to_month_end": days_to_end,
+        "is_first_3_days": int(days_to_start < 3),
+        "is_last_3_days": int(days_to_end < 3),
+        "is_first_7_days": int(days_to_start < 7),
+        "is_last_7_days": int(days_to_end < 7),
+        "month_start_weight": float(np.exp(-days_to_start / 3.0)),
+        "month_end_weight": float(np.exp(-days_to_end / 3.0)),
+        "purchase_month_start_mean": p_start_mean,
+        "redeem_month_start_mean": r_start_mean,
+    }
+
+
+# 与 preprocess.py 保持一致的节假日表
+HOLIDAYS_2014 = {
+    "2014-01-01", "2014-01-31", "2014-02-01", "2014-02-02", "2014-02-03",
+    "2014-02-04", "2014-02-05", "2014-02-06",
+    "2014-04-05", "2014-04-06", "2014-04-07",
+    "2014-05-01", "2014-05-02", "2014-05-03",
+    "2014-05-31", "2014-06-01", "2014-06-02",
+    "2014-09-06", "2014-09-07", "2014-09-08",
+    "2014-10-01", "2014-10-02", "2014-10-03", "2014-10-04",
+    "2014-10-05", "2014-10-06", "2014-10-07",
+}
+
+
+def holiday_features(date):
+    holiday_dates = sorted(pd.to_datetime(list(HOLIDAYS_2014)))
+    future = [h for h in holiday_dates if h >= date]
+    past = [h for h in holiday_dates if h <= date]
+    days_to_next = (future[0] - date).days if future else 30
+    days_from_last = (date - past[-1]).days if past else 30
+    return {
+        "is_holiday": int(date in [pd.Timestamp(h) for h in HOLIDAYS_2014]),
+        "days_to_next_holiday": days_to_next,
+        "days_from_last_holiday": days_from_last,
+        "is_day_before_holiday": int(days_to_next == 1),
+        "is_day_after_holiday": int(days_from_last == 1),
+    }
+
+
+def build_future_row(date, history, feature_cols, exog_values, history_df_full):
+    """构造未来一行的特征向量，与 preprocess.py 逻辑严格对齐。"""
     row = {c: 0 for c in feature_cols}
     row.update(date_features(date))
+    row.update(month_start_end_features(date, history))
+    row.update(holiday_features(date))
     row.update(exog_values)
 
     for target in ["purchase", "redeem"]:
         values = history[target].astype(float).tolist()
+        # lag 特征
         for lag in [1, 2, 3, 7, 14, 30]:
             row[f"{target}_lag_{lag}"] = values[-lag] if len(values) >= lag else values[-1]
+        # rolling 特征
         for window in [3, 7, 14, 30]:
             recent = values[-window:] if len(values) >= window else values
-            row[f"{target}_roll_mean_{window}"] = float(np.mean(recent))
-            row[f"{target}_roll_std_{window}"] = float(np.std(recent))
+            arr = np.array(recent)
+            row[f"{target}_roll_mean_{window}"] = float(np.mean(arr))
+            row[f"{target}_roll_std_{window}"] = float(np.std(arr))
+            row[f"{target}_roll_min_{window}"] = float(np.min(arr))
+            row[f"{target}_roll_max_{window}"] = float(np.max(arr))
+            row[f"{target}_roll_median_{window}"] = float(np.median(arr))
+        # 同期特征
+        if len(values) >= 30:
+            row[f"{target}_same_day_last_month"] = values[-30]
+        for week in [1, 2, 3, 4]:
+            idx = 7 * week
+            row[f"{target}_same_weekday_w{week}"] = values[-idx] if len(values) >= idx else values[-1]
+        weekdays = [row[f"{target}_same_weekday_w{w}"] for w in [1, 2, 3, 4]]
+        row[f"{target}_mean_same_weekday_4w"] = float(np.mean(weekdays))
+
+    # 比率与差分（基于 history）
+    last_p = history["purchase"].iloc[-1]
+    last_r = history["redeem"].iloc[-1]
+    row["purchase_redeem_ratio"] = last_p / (last_r + 1)
+    row["purchase_diff_lag1"] = history["purchase"].iloc[-1] - history["purchase"].iloc[-2] if len(history) >= 2 else 0
+    row["redeem_diff_lag1"] = history["redeem"].iloc[-1] - history["redeem"].iloc[-2] if len(history) >= 2 else 0
+    row["purchase_diff_lag7"] = history["purchase"].iloc[-1] - history["purchase"].iloc[-7] if len(history) >= 7 else 0
+    row["redeem_diff_lag7"] = history["redeem"].iloc[-1] - history["redeem"].iloc[-7] if len(history) >= 7 else 0
+    net = last_p - last_r
+    row["net_inflow"] = net
+    if len(history) >= 2:
+        row["net_inflow_lag1"] = (history["purchase"].iloc[-1] - history["redeem"].iloc[-1]) - (history["purchase"].iloc[-2] - history["redeem"].iloc[-2])
     return pd.DataFrame([row])[feature_cols].fillna(0)
 
 
@@ -55,22 +144,50 @@ def main():
 
     history = df[["date", "purchase", "redeem"]].copy()
 
-    # 9 月未来收益率、Shibor 不一定在原始数据里，这里使用最后一天的外部变量做前向填充。
+    # 9月外部变量改进：使用8月均值 + 线性外推趋势，而非单点前向填充
     non_exog = {"date", "purchase", "redeem"}
-    lag_roll_prefixes = ("purchase_lag_", "redeem_lag_", "purchase_roll_", "redeem_roll_")
-    time_cols = {"dayofweek", "dayofmonth", "month", "is_weekend", "is_month_start", "is_month_end"}
+    lag_roll_prefixes = ("purchase_lag_", "redeem_lag_", "purchase_roll_", "redeem_roll_",
+                         "purchase_same_", "redeem_same_", "purchase_diff_", "redeem_diff_",
+                         "net_inflow", "purchase_redeem_ratio")
+    time_cols = {"dayofweek", "dayofmonth", "month", "is_weekend", "is_month_start", "is_month_end",
+                 "dayofweek_sin", "dayofweek_cos", "dayofmonth_sin", "dayofmonth_cos",
+                 "month_sin", "month_cos", "days_to_month_start", "days_to_month_end",
+                 "is_first_3_days", "is_last_3_days", "is_first_7_days", "is_last_7_days",
+                 "month_start_weight", "month_end_weight", "is_holiday",
+                 "days_to_next_holiday", "days_from_last_holiday",
+                 "is_day_before_holiday", "is_day_after_holiday"}
     exog_cols = [
         c for c in feature_cols
         if c not in non_exog and c not in time_cols and not c.startswith(lag_roll_prefixes)
     ]
-    last_row = df.iloc[-1]
-    exog_values = {c: last_row[c] for c in exog_cols if c in df.columns}
+    # 用8月均值作为9月外部变量基线（比单点更稳健）
+    aug_df = df[(df["date"] >= pd.Timestamp("2014-08-01")) & (df["date"] <= pd.Timestamp("2014-08-31"))]
+    exog_values = {}
+    for c in exog_cols:
+        if c in aug_df.columns:
+            exog_values[c] = float(aug_df[c].mean())
+
+    # 历史裁剪区间
+    p_lo = np.percentile(df["purchase"], 1)
+    p_hi = np.percentile(df["purchase"], 99)
+    r_lo = np.percentile(df["redeem"], 1)
+    r_hi = np.percentile(df["redeem"], 99)
 
     pred_rows = []
     for date in pd.date_range("2014-09-01", "2014-09-30", freq="D"):
-        X = build_future_row(date, history, feature_cols, exog_values)
+        X = build_future_row(date, history, feature_cols, exog_values, df)
         purchase_pred = float(np.expm1(model_purchase.predict(X)[0]))
         redeem_pred = float(np.expm1(model_redeem.predict(X)[0]))
+
+        # 平滑修正：模型预测 × 0.85 + 近7日均值 × 0.15，缓解滚动漂移
+        recent7_p = float(history["purchase"].tail(7).mean())
+        recent7_r = float(history["redeem"].tail(7).mean())
+        purchase_pred = 0.85 * purchase_pred + 0.15 * recent7_p
+        redeem_pred = 0.85 * redeem_pred + 0.15 * recent7_r
+
+        # 裁剪到历史合理区间
+        purchase_pred = float(np.clip(purchase_pred, p_lo, p_hi))
+        redeem_pred = float(np.clip(redeem_pred, r_lo, r_hi))
         purchase_pred = max(0, purchase_pred)
         redeem_pred = max(0, redeem_pred)
 
@@ -85,9 +202,7 @@ def main():
         ], ignore_index=True)
 
     submission = pd.DataFrame(pred_rows)
-    # 天池提交样例通常不带表头，因此 tc_comp_predict_table.csv 默认保存为无表头版本。
     submission.to_csv(SUBMISSION_PATH, index=False, header=False, encoding="utf-8-sig")
-    # 额外保存一个带表头版本，便于在报告和可视化页面中查看。
     submission.to_csv(SUBMISSION_WITH_HEADER_PATH, index=False, encoding="utf-8-sig")
     print(f"预测提交文件已保存到：{SUBMISSION_PATH}")
     print(f"带表头查看文件已保存到：{SUBMISSION_WITH_HEADER_PATH}")
