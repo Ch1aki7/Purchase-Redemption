@@ -113,18 +113,22 @@ def build_future_row(date, history, feature_cols, exog_values, history_df_full):
         weekdays = [row[f"{target}_same_weekday_w{w}"] for w in [1, 2, 3, 4]]
         row[f"{target}_mean_same_weekday_4w"] = float(np.mean(weekdays))
 
-    # 比率与差分（基于 history）
-    last_p = history["purchase"].iloc[-1]
-    last_r = history["redeem"].iloc[-1]
-    row["purchase_redeem_ratio"] = last_p / (last_r + 1)
-    row["purchase_diff_lag1"] = history["purchase"].iloc[-1] - history["purchase"].iloc[-2] if len(history) >= 2 else 0
-    row["redeem_diff_lag1"] = history["redeem"].iloc[-1] - history["redeem"].iloc[-2] if len(history) >= 2 else 0
-    row["purchase_diff_lag7"] = history["purchase"].iloc[-1] - history["purchase"].iloc[-7] if len(history) >= 7 else 0
-    row["redeem_diff_lag7"] = history["redeem"].iloc[-1] - history["redeem"].iloc[-7] if len(history) >= 7 else 0
-    net = last_p - last_r
-    row["net_inflow"] = net
-    if len(history) >= 2:
-        row["net_inflow_lag1"] = (history["purchase"].iloc[-1] - history["redeem"].iloc[-1]) - (history["purchase"].iloc[-2] - history["redeem"].iloc[-2])
+    # 比率与差分（基于 history，全部用历史值，避免数据泄露）
+    last_p = float(history["purchase"].iloc[-1])
+    last_r = float(history["redeem"].iloc[-1])
+    prev_p = float(history["purchase"].iloc[-2]) if len(history) >= 2 else last_p
+    prev_r = float(history["redeem"].iloc[-2]) if len(history) >= 2 else last_r
+    p_lag7 = float(history["purchase"].iloc[-7]) if len(history) >= 7 else last_p
+    r_lag7 = float(history["redeem"].iloc[-7]) if len(history) >= 7 else last_r
+    p_lag8 = float(history["purchase"].iloc[-8]) if len(history) >= 8 else last_p
+    r_lag8 = float(history["redeem"].iloc[-8]) if len(history) >= 8 else last_r
+    row["purchase_redeem_ratio_lag1"] = last_p / (last_r + 1)
+    row["purchase_diff_lag1_hist"] = last_p - prev_p
+    row["redeem_diff_lag1_hist"] = last_r - prev_r
+    row["purchase_diff_lag7_hist"] = last_p - p_lag8
+    row["redeem_diff_lag7_hist"] = last_r - r_lag8
+    row["net_inflow_lag1"] = last_p - last_r
+    row["net_inflow_lag7"] = p_lag7 - r_lag7
     return pd.DataFrame([row])[feature_cols].fillna(0)
 
 
@@ -179,11 +183,11 @@ def main():
         purchase_pred = float(np.expm1(model_purchase.predict(X)[0]))
         redeem_pred = float(np.expm1(model_redeem.predict(X)[0]))
 
-        # 平滑修正：模型预测 × 0.85 + 近7日均值 × 0.15，缓解滚动漂移
+        # 平滑修正：模型预测 × 0.95 + 近7日均值 × 0.05，缓解滚动漂移
         recent7_p = float(history["purchase"].tail(7).mean())
         recent7_r = float(history["redeem"].tail(7).mean())
-        purchase_pred = 0.85 * purchase_pred + 0.15 * recent7_p
-        redeem_pred = 0.85 * redeem_pred + 0.15 * recent7_r
+        purchase_pred = 0.95 * purchase_pred + 0.05 * recent7_p
+        redeem_pred = 0.95 * redeem_pred + 0.05 * recent7_r
 
         # 裁剪到历史合理区间
         purchase_pred = float(np.clip(purchase_pred, p_lo, p_hi))

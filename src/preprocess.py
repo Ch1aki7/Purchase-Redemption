@@ -113,16 +113,23 @@ def add_same_period_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_ratio_diff_features(df: pd.DataFrame) -> pd.DataFrame:
-    """比率与差分特征。"""
+    """比率与差分特征（全部用 shift 派生，避免使用当天真实值造成数据泄露）。
+
+    注意：原版本使用当天 purchase/redeem 派生 purchase_redeem_ratio、
+    purchase_diff_lag1 等特征，导致数据泄露（模型输入已包含当天答案的
+    间接信息）。本版本所有特征都基于历史值（shift(1) 或更早）。
+    """
     df = df.copy()
-    df["purchase_redeem_ratio"] = df["purchase"] / (df["redeem"] + 1)
-    df["purchase_diff_lag1"] = df["purchase"] - df["purchase_lag_1"]
-    df["redeem_diff_lag1"] = df["redeem"] - df["redeem_lag_1"]
-    df["purchase_diff_lag7"] = df["purchase"] - df["purchase_lag_7"]
-    df["redeem_diff_lag7"] = df["redeem"] - df["redeem_lag_7"]
-    # 净流入
-    df["net_inflow"] = df["purchase"] - df["redeem"]
-    df["net_inflow_lag1"] = df["net_inflow"].shift(1)
+    # 昨天申购赎回比率（安全：基于昨天值）
+    df["purchase_redeem_ratio_lag1"] = df["purchase"].shift(1) / (df["redeem"].shift(1) + 1)
+    # 前天相对大前天的环比变化（安全：基于历史值）
+    df["purchase_diff_lag1_hist"] = df["purchase"].shift(1) - df["purchase"].shift(2)
+    df["redeem_diff_lag1_hist"] = df["redeem"].shift(1) - df["redeem"].shift(2)
+    df["purchase_diff_lag7_hist"] = df["purchase"].shift(1) - df["purchase"].shift(8)
+    df["redeem_diff_lag7_hist"] = df["redeem"].shift(1) - df["redeem"].shift(8)
+    # 净流入（只用历史值，shift(1) 是昨天净流入，安全）
+    df["net_inflow_lag1"] = (df["purchase"].shift(1) - df["redeem"].shift(1))
+    df["net_inflow_lag7"] = (df["purchase"].shift(7) - df["redeem"].shift(7))
     return df
 
 
