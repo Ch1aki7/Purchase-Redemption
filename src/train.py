@@ -15,12 +15,16 @@ from .evaluate import evaluate_prediction
 from .predict import build_future_row
 
 
-def build_lightgbm():
-    """LightGBM 调参版：更多树 + 早停 + 正则化（调参实验最优配置）。"""
+def build_lightgbm(seed=42):
+    """LightGBM 调参版：更多树 + 小学习率 + 早停 + 正则化（第四轮调优实验最优配置）。
+
+    第四轮调优实验发现：learning_rate=0.001, n_estimators=10000 比原配置
+    (0.003, 5000) 略优，且配合多种子集成可进一步降低方差。
+    """
     from lightgbm import LGBMRegressor
     return LGBMRegressor(
-        n_estimators=5000,
-        learning_rate=0.003,
+        n_estimators=10000,
+        learning_rate=0.001,
         num_leaves=31,
         max_depth=-1,
         min_child_samples=5,
@@ -29,7 +33,7 @@ def build_lightgbm():
         colsample_bytree=0.85,
         reg_alpha=0.05,
         reg_lambda=0.05,
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         verbose=-1,
     )
@@ -82,33 +86,45 @@ def fit_single_model(model, X_train, y_train, X_valid=None, y_valid=None, use_ea
 
 
 class EnsembleModel:
-    """LightGBM + RandomForest 加权集成（含目标变换的预测还原能力）。"""
+    """多种子 LightGBM 集成（第四轮调优发现纯LightGBM多种子平均最优）。
 
-    def __init__(self, lgb_weight=0.7, rf_weight=0.3):
+    内部训练 n_seeds 个不同随机种子的 LightGBM，预测时取平均。
+    这比单模型方差更小，比加入 RandomForest 效果更好（RF 在该数据上贡献为负）。
+    含目标变换的预测还原能力。
+    """
+
+    def __init__(self, lgb_weight=1.0, rf_weight=0.0, n_seeds=3):
         self.lgb_weight = lgb_weight
         self.rf_weight = rf_weight
-        self.lgb_model = None
+        self.n_seeds = n_seeds
+        self.lgb_models = []
         self.rf_model = None
-        self.use_ensemble = True
+        self.use_ensemble = False  # 是否使用 RF
 
     def fit(self, X_train, y_train, X_valid, y_valid):
-        # LightGBM 用早停
-        self.lgb_model = build_lightgbm()
-        self.lgb_model = fit_single_model(
-            self.lgb_model, X_train, y_train, X_valid, y_valid, use_early_stop=True
-        )
-        # RandomForest 无早停
-        try:
-            self.rf_model = build_rf()
-            self.rf_model.fit(X_train, y_train)
-        except Exception as e:
-            print(f"RandomForest 训练失败，仅用 LightGBM：{e}")
-            self.use_ensemble = False
+        # 多种子 LightGBM
+        self.lgb_models = []
+        for seed in range(42, 42 + self.n_seeds):
+            m = build_lightgbm(seed=seed)
+            m = fit_single_model(
+                m, X_train, y_train, X_valid, y_valid, use_early_stop=True
+            )
+            self.lgb_models.append(m)
+        # RandomForest 保留接口但不使用（调优实验证明权重0最优）
+        if self.rf_weight > 0:
+            try:
+                self.rf_model = build_rf()
+                self.rf_model.fit(X_train, y_train)
+                self.use_ensemble = True
+            except Exception as e:
+                print(f"RandomForest 训练失败：{e}")
         return self
 
     def predict(self, X):
-        lgb_pred = self.lgb_model.predict(X)
-        if not self.use_ensemble or self.rf_model is None:
+        # 多种子 LightGBM 平均
+        preds = [m.predict(X) for m in self.lgb_models]
+        lgb_pred = np.mean(preds, axis=0)
+        if not self.use_ensemble or self.rf_model is None or self.rf_weight == 0:
             return lgb_pred
         rf_pred = self.rf_model.predict(X)
         return self.lgb_weight * lgb_pred + self.rf_weight * rf_pred
@@ -187,11 +203,12 @@ def main():
         X = build_future_row(date, history, feature_cols, exog_values_aug, df)
         p_pred = float(np.expm1(model_purchase.predict(X)[0]))
         r_pred = float(np.expm1(model_redeem.predict(X)[0]))
-        # 平滑修正：模型预测 × 0.95 + 近7日均值 × 0.05，缓解滚动漂移
+        # 平滑修正：模型预测 × 0.99 + 近7日均值 × 0.01，缓解滚动漂移
+        # 第四轮调优实验：smooth_w=0.99 比 0.95 略优（5.19 vs 5.15）
         recent7_p = float(history["purchase"].tail(7).mean())
         recent7_r = float(history["redeem"].tail(7).mean())
-        p_pred = 0.95 * p_pred + 0.05 * recent7_p
-        r_pred = 0.95 * r_pred + 0.05 * recent7_r
+        p_pred = 0.99 * p_pred + 0.01 * recent7_p
+        r_pred = 0.99 * r_pred + 0.01 * recent7_r
         # 裁剪
         p_pred = float(np.clip(p_pred, p_lo, p_hi))
         r_pred = float(np.clip(r_pred, r_lo, r_hi))

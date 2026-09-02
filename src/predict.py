@@ -183,11 +183,12 @@ def main():
         purchase_pred = float(np.expm1(model_purchase.predict(X)[0]))
         redeem_pred = float(np.expm1(model_redeem.predict(X)[0]))
 
-        # 平滑修正：模型预测 × 0.95 + 近7日均值 × 0.05，缓解滚动漂移
+        # 平滑修正：模型预测 × 0.99 + 近7日均值 × 0.01，缓解滚动漂移
+        # 第四轮调优实验：smooth_w=0.99 比 0.95 略优（5.19 vs 5.15）
         recent7_p = float(history["purchase"].tail(7).mean())
         recent7_r = float(history["redeem"].tail(7).mean())
-        purchase_pred = 0.95 * purchase_pred + 0.05 * recent7_p
-        redeem_pred = 0.95 * redeem_pred + 0.05 * recent7_r
+        purchase_pred = 0.99 * purchase_pred + 0.01 * recent7_p
+        redeem_pred = 0.99 * redeem_pred + 0.01 * recent7_r
 
         # 裁剪到历史合理区间
         purchase_pred = float(np.clip(purchase_pred, p_lo, p_hi))
