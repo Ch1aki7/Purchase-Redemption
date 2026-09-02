@@ -10,64 +10,178 @@
 
 - 数据读取与预处理
 - 每日申购/赎回聚合
-- 日期特征、滞后特征、滚动统计特征构造
-- LightGBM 回归建模，若本地无法安装 LightGBM，则自动降级为随机森林
+- 多维特征工程：周期傅里叶编码、月初月末连续特征、节假日特征、滞后/滚动统计、历史同期、比率差分
+- LightGBM + RandomForest 加权集成建模（权重 0.95:0.05）
 - 2014 年 8 月验证集评估
 - 2014 年 9 月滚动预测
 - Streamlit 可视化展示
 - 课程需求分析文档
-- 原项目脚本归档
 
 ## 二、目录结构
 
 ```text
 Purchase-Redemption/
-├── Purchase Redemption Data/
-│   └── README.txt                         # 数据放置说明，原始数据不提交 GitHub
-├── src/
-│   ├── config.py                          # 路径配置
-│   ├── data_loader.py                     # 数据读取
-│   ├── preprocess.py                      # 预处理与特征工程
-│   ├── train.py                           # 模型训练与验证
-│   ├── predict.py                         # 9 月预测与提交文件生成
-│   └── evaluate.py                        # 评估函数
-├── app.py                                 # Streamlit 可视化系统
-├── run_all.py                             # 一键运行完整流程
-├── requirements.txt                       # Python 依赖
-├── output/
-│   └── README.txt                         # 运行后生成预测和验证结果
-├── models/
-│   └── README.txt                         # 运行后保存模型文件
-├── legacy_original_project/               # 你原本项目中的脚本和说明归档
-├── 项目二_需求分析与最小方案.md
-├── 项目二_需求分析与最小方案_目录更新版.pdf
-└── .gitignore
+├── Purchase Redemption Data/                 # 原始赛题数据目录（不提交 Git）
+│   ├── user_balance_table.csv               # 用户申购赎回表（核心大表，约 150MB）
+│   ├── user_profile_table.csv               # 用户信息表（性别/城市/星座）
+│   ├── mfd_day_share_interest.csv            # 余额宝收益率表（万份收益/7日年化）
+│   ├── mfd_bank_shibor.csv                   # Shibor 同业拆借利率表（8个期限）
+│   ├── comp_predict_table.csv               # 赛题官方提交示例文件
+│   └── README.txt                            # 数据说明文档
+│
+├── src/                                      # 核心源码包
+│   ├── __init__.py                           # 包初始化文件，使 src 可作为模块导入
+│   ├── config.py                             # 路径配置（统一管理所有输入输出路径）
+│   ├── data_loader.py                        # 数据读取（加载4张原始表并做基本清洗）
+│   ├── preprocess.py                         # 预处理与特征工程（构造113个特征）
+│   ├── train.py                              # 模型训练与验证（LightGBM+RF集成）
+│   ├── predict.py                            # 9月滚动预测与提交文件生成
+│   └── evaluate.py                           # 评估函数（MAPE与模拟评分计算）
+│
+├── output/                                   # 运行结果输出目录（运行后生成）
+│   ├── daily_features.csv                    # 预处理后的日级训练数据（含全部特征）
+│   ├── validation_prediction.csv             # 8月验证集预测结果（含真实值/预测值/误差）
+│   ├── tc_comp_predict_table.csv             # 9月最终预测提交文件（无表头，赛题格式）
+│   └── tc_comp_predict_table_with_header.csv # 9月预测带表头版本（便于查看）
+│
+├── models/                                   # 训练好的模型文件目录（运行后生成）
+│   ├── model_purchase.pkl                    # 申购预测模型（LightGBM+RF集成）
+│   ├── model_redeem.pkl                      # 赎回预测模型（LightGBM+RF集成）
+│   └── feature_columns.json                  # 特征列名清单（预测时保持特征一致）
+│
+├── app.py                                    # Streamlit 可视化系统主入口
+├── run_all.py                                # 一键运行完整流程（预处理→训练→预测）
+├── requirements.txt                          # Python 依赖清单
+├── Purchase Redemption Data.zip              # 原始数据压缩包（备份，不提交 Git）
+├── 项目二_需求分析与最小方案.md                # 课程需求分析与方案设计文档
+├── LICENSE                                   # 开源许可证（MIT）
+└── .gitignore                                # Git 忽略规则
 ```
 
-## 三、数据放置
+### 关键文件说明
 
-由于上传文件和 GitHub 仓库大小限制，本仓库不包含原始赛题数据。运行前请把天池数据解压到：
+**源码模块（`src/`）**
+
+| 文件 | 作用 | 关键函数 |
+|---|---|---|
+| `config.py` | 集中管理所有文件路径，避免硬编码 | `DAILY_FEATURES_PATH`、`MODEL_PURCHASE_PATH` 等 |
+| `data_loader.py` | 读取4张原始 CSV，解析日期，返回 DataFrame | `load_user_balance()`、`load_share_interest()` 等 |
+| `preprocess.py` | 聚合每日总量，构造113个特征并保存到 `output/daily_features.csv` | `add_month_start_end_features()`、`add_holiday_features()` 等 |
+| `train.py` | 训练 LightGBM+RandomForest 集成模型，用8月做验证集评估 | `EnsembleModel` 类、`build_lightgbm()` |
+| `predict.py` | 对9月30天做滚动预测，生成赛题提交格式文件 | `rolling_predict()` |
+| `evaluate.py` | 计算 MAPE 和模拟评分，供训练和可视化共用 | `evaluate_prediction()` |
+
+**运行结果（`output/`）**
+
+| 文件 | 作用 | 生成阶段 |
+|---|---|---|
+| `daily_features.csv` | 预处理后的日级宽表，每行一天，包含 purchase/redeem 和113个特征 | `preprocess.py` 运行后 |
+| `validation_prediction.csv` | 8月验证集预测对比，含 date、purchase_true/pred、redeem_true/pred | `train.py` 运行后 |
+| `tc_comp_predict_table.csv` | 9月预测提交文件，无表头，格式为 `report_date,purchase,redeem`，共30行 | `predict.py` 运行后 |
+| `tc_comp_predict_table_with_header.csv` | 带表头版本，便于人工查看和可视化展示 | `predict.py` 运行后 |
+
+**模型文件（`models/`）**
+
+| 文件 | 作用 |
+|---|---|
+| `model_purchase.pkl` | 申购预测模型，`joblib` 序列化的 `EnsembleModel` 对象 |
+| `model_redeem.pkl` | 赎回预测模型，同上 |
+| `feature_columns.json` | 训练时的特征列名顺序，预测时必须保持一致 |
+
+**原始数据（`Purchase Redemption Data/`）**
+
+| 文件 | 说明 |
+|---|---|
+| `user_balance_table.csv` | 约 280 万条用户交易记录，覆盖 2013.07.01~2014.08.31，是聚合每日总量的数据源 |
+| `user_profile_table.csv` | 约 2.8 万用户的人口属性信息，本项目的每日总量预测未直接使用 |
+| `mfd_day_share_interest.csv` | 余额宝每日万份收益和7日年化收益率，作为外部特征 |
+| `mfd_bank_shibor.csv` | 8 个期限的 Shibor 利率，作为外部特征 |
+| `comp_predict_table.csv` | 赛题官方提交示例，参考格式用 |
+
+## 三、代码流程
+
+本章节阐释整个项目的运行逻辑，从原始数据到最终预测结果的完整链路。
+
+### 3.1 整体流程
+
+```
+Purchase Redemption Data/          原始数据（4张CSV表）
+        ↓
+src/preprocess.py                  预处理 + 特征工程
+        ↓
+output/daily_features.csv          日级宽表（含113个特征）
+        ↓
+src/train.py                       训练集成模型
+        ↓
+models/model_purchase.pkl          申购模型
+models/model_redeem.pkl            赎回模型
+models/feature_columns.json        特征列名契约
+        ↓
+output/validation_prediction.csv   8月验证集评估
+        ↓
+src/predict.py                     9月滚动预测
+        ↓
+output/tc_comp_predict_table.csv   赛题提交文件（30天预测）
+```
+
+### 3.2 各阶段详解
+
+**阶段1：预处理与特征工程（`src/preprocess.py`）**
+
+- 从 `user_balance_table.csv` 按 `report_date` 聚合，得到每日 `purchase` 和 `redeem` 总量
+- 合并收益率表和 Shibor 利率表
+- 构造 113 个特征：周期傅里叶编码、月初月末连续特征、节假日、滞后/滚动统计、历史同期、比率差分
+- 输出 `output/daily_features.csv`
+
+**阶段2：模型训练（`src/train.py`）**
+
+- 读取 `daily_features.csv`，按日期切分：训练集 2013.08~2014.07，验证集 2014.08
+- 对 `purchase` 和 `redeem` 分别训练 `EnsembleModel`（LightGBM 权重 0.95 + RandomForest 权重 0.05）
+- 训练时目标做 `log1p` 变换（日总量上亿分，取对数稳定方差）
+- LightGBM 用验证集做 100 轮早停，自动找最优迭代轮数
+- 预测值裁剪到训练集 P1~P99 分位数区间，避免极端值
+- 用 `joblib.dump` 保存模型到 `models/`，同时保存特征列名到 `feature_columns.json`
+
+**阶段3：9月滚动预测（`src/predict.py`）**
+
+- 用 `joblib.load` 加载模型，读取 `feature_columns.json` 对齐特征顺序
+- 逐天滚动预测：第 1 天用 8 月最后一天的特征预测，预测值回填为第 2 天的 lag 特征
+- 9 月的收益率和 Shibor（未来未知）用 8 月均值填充
+- 平滑修正：模型预测 × 0.85 + 近 7 日均值 × 0.15，缓解滚动漂移
+- 输出 `output/tc_comp_predict_table.csv`（无表头，赛题格式）和带表头版本
+
+### 3.3 models 目录文件说明
+
+`models/` 下的三个文件由 `src/train.py` 生成，供 `src/predict.py` 使用：
+
+| 文件 | 生成方式 | 用途 |
+|---|---|---|
+| `model_purchase.pkl` | `joblib.dump(EnsembleModel)` 保存申购预测模型 | `predict.py` 加载后做 9 月申购预测 |
+| `model_redeem.pkl` | 同上，保存赎回预测模型 | `predict.py` 加载后做 9 月赎回预测 |
+| `feature_columns.json` | `json.dump(feature_cols)` 保存 113 个特征列名顺序 | `predict.py` 按此顺序构造特征矩阵，保证与训练一致 |
+
+**为什么不直接用，要保存？** 训练耗时几分钟，预测只需几秒。保存后可复用模型，不用每次预测都重训。
+
+**`feature_columns.json` 的作用**：训练和预测必须用完全一致的特征顺序，否则模型报错或预测错乱。重新预处理后特征列可能变化，此时需重训模型，这个 JSON 是训练与预测之间的「契约」。
+
+### 3.4 数据放置要求
+
+原始赛题数据不提交到 Git，运行前请把天池数据解压到：
 
 ```text
 Purchase Redemption Data/
 ```
 
-推荐文件名如下：
+必需文件：
 
 ```text
+user_balance_table.csv      # 核心大表，约 280 万条，缺它无法训练
 user_profile_table.csv
-user_balance_table.csv
 mfd_day_share_interest.csv
 mfd_bank_shibor.csv
 ```
 
-其中最重要的是：
-
-```text
-user_balance_table.csv
-```
-
-如果缺少这个文件，模型无法训练。
+如果缺少 `user_balance_table.csv`，模型无法训练。
 
 ## 四、安装依赖
 
@@ -127,6 +241,17 @@ streamlit run app.py
 
 2014 年 9 月真实值属于隐藏测试集，本地无法直接知道最终预测是否完全正确。因此本项目使用 2014 年 8 月作为验证集，模拟未来 30 天预测，并计算申购和赎回的相对误差。
 
+当前验证集评估结果（满分 10）：
+
+| 指标 | 数值 |
+|---|---|
+| 申购 MAPE | 6.01% |
+| 赎回 MAPE | 5.22% |
+| 申购评分 | 8.00 |
+| 赎回评分 | 8.26 |
+| **模拟总分** | **8.14** |
+| 误差 >30% 的零分日 | 0 天 |
+
 评估结果主要查看：
 
 - 申购 MAPE
@@ -146,28 +271,17 @@ streamlit run app.py
 - 压缩包
 - Python 缓存文件
 
-可以按下面流程提交：
+日常更新代码只需：
 
 ```bash
-git init
 git add .
-git commit -m "Initial commit: purchase redemption prediction project"
-git branch -M main
-git remote add origin 你的GitHub仓库地址
-git push -u origin main
+git commit -m "你的提交说明"
+git push
 ```
 
-如果你的目录原本已经是 Git 仓库，则从 `git add .` 开始即可。
+若首次复现本仓库到新的本地目录，用 `git clone https://github.com/Ch1aki7/Purchase-Redemption.git` 即可。
 
 ## 九、原项目文件说明
-
-`legacy_original_project/` 中保留了你原本项目里的脚本和文档，便于查阅：
-
-- `01_data_exploration.py`
-- `02_feature_engineering.py`
-- `03_train_data_prepare.py`
-- `README_original.md`
-- 部分原项目输出结果
 
 当前推荐运行主流程为：
 
@@ -175,3 +289,5 @@ git push -u origin main
 python run_all.py
 streamlit run app.py
 ```
+
+项目已集成端到端流程：数据预处理 → 特征工程 → LightGBM+RandomForest 集成训练 → 滚动预测 → 可视化展示。验证集模拟总分约 8.14 分（满分 10）。

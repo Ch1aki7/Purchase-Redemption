@@ -15,13 +15,14 @@ from .config import (
 from .evaluate import evaluate_prediction
 
 
-def build_model(model_type="lightgbm", n_estimators=400, learning_rate=0.03, max_depth=-1, num_leaves=31):
+def build_model(model_type="lightgbm", n_estimators=5000, learning_rate=0.003, max_depth=-1, num_leaves=31):
     model_type = (model_type or "lightgbm").lower()
     if model_type == "randomforest":
         depth = None if max_depth is None or max_depth < 0 else int(max_depth)
         return RandomForestRegressor(
             n_estimators=int(n_estimators),
             max_depth=depth,
+            min_samples_leaf=3,
             random_state=42,
             n_jobs=-1,
         )
@@ -34,16 +35,22 @@ def build_model(model_type="lightgbm", n_estimators=400, learning_rate=0.03, max
             learning_rate=float(learning_rate),
             max_depth=int(max_depth),
             num_leaves=int(num_leaves),
-            subsample=0.9,
-            colsample_bytree=0.9,
+            min_child_samples=5,
+            subsample=0.85,
+            subsample_freq=1,
+            colsample_bytree=0.85,
+            reg_alpha=0.05,
+            reg_lambda=0.05,
             random_state=42,
+            n_jobs=-1,
+            verbose=-1,
         )
     except Exception:
         print("未能使用 LightGBM，自动降级为 RandomForestRegressor。")
         return build_model(
             model_type="randomforest",
-            n_estimators=n_estimators,
-            max_depth=max_depth if max_depth and max_depth > 0 else 12,
+            n_estimators=min(int(n_estimators), 300),
+            max_depth=15,
         )
 
 
@@ -58,7 +65,7 @@ def load_prepared_frame():
     if not DAILY_FEATURES_PATH.exists():
         raise FileNotFoundError("请先运行 python -m src.preprocess 或 python run_all.py")
     df = pd.read_csv(DAILY_FEATURES_PATH, parse_dates=["date"]).sort_values("date")
-    return df[df["date"] >= pd.Timestamp("2013-07-31")].copy()
+    return df[df["date"] >= pd.Timestamp("2013-08-01")].copy()
 
 
 def split_train_valid(df: pd.DataFrame):
@@ -126,8 +133,8 @@ def train_and_evaluate(model_params=None, save=True, run_cv=True, n_splits=3):
     """供命令行与可视化系统复用的训练入口。"""
     model_params = dict(model_params or {})
     model_params.setdefault("model_type", "lightgbm")
-    model_params.setdefault("n_estimators", 400)
-    model_params.setdefault("learning_rate", 0.03)
+    model_params.setdefault("n_estimators", 5000)
+    model_params.setdefault("learning_rate", 0.003)
     model_params.setdefault("max_depth", -1)
     model_params.setdefault("num_leaves", 31)
 
