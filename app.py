@@ -238,6 +238,26 @@ with st.sidebar:
     st.divider()
     st.header("运行控制")
     st.warning("一键运行完整流程会重新生成 output/ 下的特征、验证和预测文件，并覆盖 models/ 下的正式模型文件。")
+    with st.expander("完整流程固定参数说明", expanded=False):
+        st.markdown(
+            """
+            **一键运行完整流程使用 `src/train.py` 和 `src/predict.py` 中的固定正式配置，\
+            不会读取下方交互训练区域的页面参数。**
+
+            - 训练数据：`2013-08-01` 至 `2014-07-31`
+            - 本地验证：`2014-08-01` 至 `2014-08-31`，采用逐日滚动预测
+            - 最终预测：`2014-09-01` 至 `2014-09-30`，逐日滚动预测并回填预测值
+            - 主模型：多种子 `LightGBM` 集成，申购和赎回分别训练
+            - 集成设置：`n_seeds=3`，随机种子为 `42、43、44`
+            - LightGBM 参数：`n_estimators=10000`，`learning_rate=0.001`，`num_leaves=31`，`max_depth=-1`
+            - 正则与采样：`min_child_samples=5`，`subsample=0.85`，`colsample_bytree=0.85`，`reg_alpha=0.05`，`reg_lambda=0.05`
+            - 目标变换：训练时使用 `log1p`，预测后使用 `expm1` 还原金额
+            - 平滑修正：`预测值 × 0.99 + 近7日均值 × 0.01`
+            - 月末后处理：月末最后3天申购 `×1.2`，赎回 `×1.3`
+            - 外部变量：8月验证使用7月均值，9月预测使用8月均值
+            - 输出文件：`output/daily_features.csv`、`output/data_quality_report.csv`、`output/validation_prediction.csv`、`output/tc_comp_predict_table.csv`、`models/*.pkl`
+            """
+        )
     if st.button("一键运行完整流程", type="secondary"):
         with st.spinner("正在执行 run_all.py，可能需要几分钟..."):
             result = subprocess.run(
