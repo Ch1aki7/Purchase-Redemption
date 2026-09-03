@@ -53,6 +53,7 @@ Purchase-Redemption/
 ├── run_all.py                                # 一键运行完整流程（预处理→训练→预测）
 ├── requirements.txt                          # Python 依赖清单
 ├── Purchase Redemption Data.zip              # 原始数据压缩包（备份，不提交 Git）
+├── 设计报告.md                                # 面向课程指导书要求的项目设计报告
 ├── 项目二_需求分析与最小方案.md                # 课程需求分析与方案设计文档
 ├── LICENSE                                   # 开源许可证（MIT）
 └── .gitignore                                # Git 忽略规则
