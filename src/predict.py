@@ -2,6 +2,8 @@ import json
 import joblib
 import numpy as np
 import pandas as pd
+from .calendar_features import CALENDAR_FEATURE_COLUMNS, calendar_feature_dict
+from .behavior_features import behavior_feature_dict
 from .config import (
     DAILY_FEATURES_PATH,
     FEATURE_COLUMNS_PATH,
@@ -9,6 +11,9 @@ from .config import (
     MODEL_REDEEM_PATH,
     SUBMISSION_PATH,
     SUBMISSION_WITH_HEADER_PATH,
+    SEASONAL_WEEKDAY_LOOKBACK,
+    PURCHASE_MODEL_WEIGHT,
+    REDEEM_MODEL_WEIGHT,
 )
 
 
@@ -54,32 +59,23 @@ def month_start_end_features(date, history):
     }
 
 
-# 与 preprocess.py 保持一致的节假日表
-HOLIDAYS_2014 = {
-    "2014-01-01", "2014-01-31", "2014-02-01", "2014-02-02", "2014-02-03",
-    "2014-02-04", "2014-02-05", "2014-02-06",
-    "2014-04-05", "2014-04-06", "2014-04-07",
-    "2014-05-01", "2014-05-02", "2014-05-03",
-    "2014-05-31", "2014-06-01", "2014-06-02",
-    "2014-09-06", "2014-09-07", "2014-09-08",
-    "2014-10-01", "2014-10-02", "2014-10-03", "2014-10-04",
-    "2014-10-05", "2014-10-06", "2014-10-07",
-}
-
-
 def holiday_features(date):
-    holiday_dates = sorted(pd.to_datetime(list(HOLIDAYS_2014)))
-    future = [h for h in holiday_dates if h >= date]
-    past = [h for h in holiday_dates if h <= date]
-    days_to_next = (future[0] - date).days if future else 30
-    days_from_last = (date - past[-1]).days if past else 30
-    return {
-        "is_holiday": int(date in [pd.Timestamp(h) for h in HOLIDAYS_2014]),
-        "days_to_next_holiday": days_to_next,
-        "days_from_last_holiday": days_from_last,
-        "is_day_before_holiday": int(days_to_next == 1),
-        "is_day_after_holiday": int(days_from_last == 1),
-    }
+    features = calendar_feature_dict(date)
+    features["days_to_next_holiday"] = features["days_to_holiday_start"]
+    features["days_from_last_holiday"] = features["days_from_holiday_end"]
+    features["is_day_before_holiday"] = features["is_pre_holiday_1d"]
+    features["is_day_after_holiday"] = features["is_post_holiday_1d"]
+    return features
+
+
+def weekday_anchor(date, history, target, lookback=SEASONAL_WEEKDAY_LOOKBACK):
+    """Return a stable same-weekday mean using only pre-forecast observations."""
+    values = history.loc[
+        history["date"].dt.dayofweek == date.dayofweek, target
+    ].tail(lookback)
+    if values.empty:
+        values = history[target].tail(lookback)
+    return float(values.mean())
 
 
 def build_future_row(date, history, feature_cols, exog_values, history_df_full):
@@ -89,6 +85,7 @@ def build_future_row(date, history, feature_cols, exog_values, history_df_full):
     row.update(month_start_end_features(date, history))
     row.update(holiday_features(date))
     row.update(exog_values)
+    row.update(behavior_feature_dict(date, history_df_full))
 
     for target in ["purchase", "redeem"]:
         values = history[target].astype(float).tolist()
@@ -112,6 +109,14 @@ def build_future_row(date, history, feature_cols, exog_values, history_df_full):
             row[f"{target}_same_weekday_w{week}"] = values[-idx] if len(values) >= idx else values[-1]
         weekdays = [row[f"{target}_same_weekday_w{w}"] for w in [1, 2, 3, 4]]
         row[f"{target}_mean_same_weekday_4w"] = float(np.mean(weekdays))
+        for window in [4, 8, 12]:
+            same_weekday = np.array([
+                values[-7 * week] if len(values) >= 7 * week else values[-1]
+                for week in range(1, window + 1)
+            ])
+            row[f"{target}_weekday_mean_{window}w"] = float(np.mean(same_weekday))
+            row[f"{target}_weekday_median_{window}w"] = float(np.median(same_weekday))
+            row[f"{target}_weekday_std_{window}w"] = float(np.std(same_weekday, ddof=1))
 
     # 比率与差分（基于 history，全部用历史值，避免数据泄露）
     last_p = float(history["purchase"].iloc[-1])
@@ -151,15 +156,16 @@ def main():
     # 9月外部变量改进：使用8月均值 + 线性外推趋势，而非单点前向填充
     non_exog = {"date", "purchase", "redeem"}
     lag_roll_prefixes = ("purchase_lag_", "redeem_lag_", "purchase_roll_", "redeem_roll_",
-                         "purchase_same_", "redeem_same_", "purchase_diff_", "redeem_diff_",
-                         "net_inflow", "purchase_redeem_ratio")
+                          "purchase_same_", "redeem_same_", "purchase_diff_", "redeem_diff_",
+                          "purchase_weekday_", "redeem_weekday_",
+                          "net_inflow", "purchase_redeem_ratio")
     time_cols = {"dayofweek", "dayofmonth", "month", "is_weekend", "is_month_start", "is_month_end",
                  "dayofweek_sin", "dayofweek_cos", "dayofmonth_sin", "dayofmonth_cos",
                  "month_sin", "month_cos", "days_to_month_start", "days_to_month_end",
                  "is_first_3_days", "is_last_3_days", "is_first_7_days", "is_last_7_days",
                  "month_start_weight", "month_end_weight", "is_holiday",
                  "days_to_next_holiday", "days_from_last_holiday",
-                 "is_day_before_holiday", "is_day_after_holiday"}
+                 "is_day_before_holiday", "is_day_after_holiday"} | CALENDAR_FEATURE_COLUMNS
     exog_cols = [
         c for c in feature_cols
         if c not in non_exog and c not in time_cols and not c.startswith(lag_roll_prefixes)
@@ -178,11 +184,7 @@ def main():
     r_hi = np.percentile(df["redeem"], 99)
 
     pred_rows = []
-    # 第五轮优化：月末3天上调（申购×1.2，赎回×1.3）
-    # 实验验证：月末资金集中进出，模型系统性低估，上调后多数月末日误差降到30%以下
-    # 验证集总分从5.19提升到5.43（零分日从9个减到6个）
-    LAST3_P_BOOST = 1.2
-    LAST3_R_BOOST = 1.3
+    anchor_history = history.copy()
     for date in pd.date_range("2014-09-01", "2014-09-30", freq="D"):
         X = build_future_row(date, history, feature_cols, exog_values, df)
         purchase_pred = float(np.expm1(model_purchase.predict(X)[0]))
@@ -194,12 +196,22 @@ def main():
         recent7_r = float(history["redeem"].tail(7).mean())
         purchase_pred = 0.99 * purchase_pred + 0.01 * recent7_p
         redeem_pred = 0.99 * redeem_pred + 0.01 * recent7_r
+        purchase_recursive = float(np.clip(purchase_pred, p_lo, p_hi))
+        redeem_recursive = float(np.clip(redeem_pred, r_lo, r_hi))
 
-        # 月末3天上调（第五轮优化）
-        dim = date.days_in_month
-        if date.day >= dim - 2:
-            purchase_pred *= LAST3_P_BOOST
-            redeem_pred *= LAST3_R_BOOST
+        # 用预测开始前最近12个同星期日均值约束递归漂移。
+        purchase_pred = (
+            PURCHASE_MODEL_WEIGHT * purchase_recursive
+            + (1 - PURCHASE_MODEL_WEIGHT) * weekday_anchor(
+                date, anchor_history, "purchase"
+            )
+        )
+        redeem_pred = (
+            REDEEM_MODEL_WEIGHT * redeem_recursive
+            + (1 - REDEEM_MODEL_WEIGHT) * weekday_anchor(
+                date, anchor_history, "redeem"
+            )
+        )
 
         # 裁剪到历史合理区间
         purchase_pred = float(np.clip(purchase_pred, p_lo, p_hi))
@@ -214,7 +226,11 @@ def main():
         })
         history = pd.concat([
             history,
-            pd.DataFrame({"date": [date], "purchase": [purchase_pred], "redeem": [redeem_pred]})
+            pd.DataFrame({
+                "date": [date],
+                "purchase": [purchase_recursive],
+                "redeem": [redeem_recursive],
+            })
         ], ignore_index=True)
 
     submission = pd.DataFrame(pred_rows)

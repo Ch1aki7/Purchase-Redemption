@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 from .config import DAILY_FEATURES_PATH, DATA_QUALITY_REPORT_PATH
 from .data_loader import load_all_tables, normalize_columns
+from .calendar_features import calendar_feature_dict
+from .behavior_features import add_behavior_history_features
 
 
 def parse_date(series):
@@ -94,38 +96,18 @@ def add_month_start_end_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# 2014年中国法定节假日 + 重要调休日
-HOLIDAYS_2014 = {
-    "2014-01-01", "2014-01-31", "2014-02-01", "2014-02-02", "2014-02-03",
-    "2014-02-04", "2014-02-05", "2014-02-06",  # 春节
-    "2014-04-05", "2014-04-06", "2014-04-07",  # 清明
-    "2014-05-01", "2014-05-02", "2014-05-03",  # 劳动节
-    "2014-05-31", "2014-06-01", "2014-06-02",  # 端午
-    "2014-09-06", "2014-09-07", "2014-09-08",  # 中秋
-    "2014-10-01", "2014-10-02", "2014-10-03", "2014-10-04",
-    "2014-10-05", "2014-10-06", "2014-10-07",  # 国庆
-}
-
-
 def add_holiday_features(df: pd.DataFrame) -> pd.DataFrame:
-    """节假日特征：2014年中秋节9月8日、国庆等。"""
+    """法定假期、调休、假期位置与月内工作日特征。"""
     df = df.copy()
-    holiday_set = pd.to_datetime(list(HOLIDAYS_2014))
-    df["is_holiday"] = df["date"].isin(holiday_set).astype(int)
-
-    # 距下一个/上一个节假日的天数
-    holiday_dates = sorted(holiday_set)
-    def days_to_next(d):
-        future = [h for h in holiday_dates if h >= d]
-        return (future[0] - d).days if future else 30
-    def days_from_last(d):
-        past = [h for h in holiday_dates if h <= d]
-        return (d - past[-1]).days if past else 30
-    df["days_to_next_holiday"] = df["date"].map(days_to_next)
-    df["days_from_last_holiday"] = df["date"].map(days_from_last)
-    # 节前1天标记（资金往往节前流出）
-    df["is_day_before_holiday"] = (df["days_to_next_holiday"] == 1).astype(int)
-    df["is_day_after_holiday"] = (df["days_from_last_holiday"] == 1).astype(int)
+    calendar = pd.DataFrame(
+        [calendar_feature_dict(date) for date in df["date"]], index=df.index
+    )
+    df[calendar.columns] = calendar
+    # 兼容已有模型和展示字段。
+    df["days_to_next_holiday"] = df["days_to_holiday_start"]
+    df["days_from_last_holiday"] = df["days_from_holiday_end"]
+    df["is_day_before_holiday"] = df["is_pre_holiday_1d"]
+    df["is_day_after_holiday"] = df["is_post_holiday_1d"]
     return df
 
 
@@ -150,12 +132,21 @@ def add_same_period_features(df: pd.DataFrame) -> pd.DataFrame:
     for target in ["purchase", "redeem"]:
         # 上月同日（lag 30 近似，但更稳定用shift）
         df[f"{target}_same_day_last_month"] = df[target].shift(30)
-        # 过去4周同星期几的均值
+        # 过去同星期几的多尺度统计，全部至少滞后7天。
+        weekday_lags = {}
+        for week in range(1, 13):
+            weekday_lags[week] = df[target].shift(7 * week)
         for week in [1, 2, 3, 4]:
-            df[f"{target}_same_weekday_w{week}"] = df[target].shift(7 * week)
-        df[f"{target}_mean_same_weekday_4w"] = df[
-            [f"{target}_same_weekday_w{w}" for w in [1, 2, 3, 4]]
-        ].mean(axis=1)
+            df[f"{target}_same_weekday_w{week}"] = weekday_lags[week]
+        for window in [4, 8, 12]:
+            values = pd.concat(
+                [weekday_lags[week] for week in range(1, window + 1)], axis=1
+            )
+            df[f"{target}_weekday_mean_{window}w"] = values.mean(axis=1)
+            df[f"{target}_weekday_median_{window}w"] = values.median(axis=1)
+            df[f"{target}_weekday_std_{window}w"] = values.std(axis=1)
+        # 兼容原字段名。
+        df[f"{target}_mean_same_weekday_4w"] = df[f"{target}_weekday_mean_4w"]
     return df
 
 
@@ -199,8 +190,29 @@ def main():
         inconsistent_records = quality_report.loc[0, "inconsistent_records"]
         print(f"余额一致性异常记录数：{inconsistent_records}")
 
-    # 1. 聚合每日申购/赎回总额
+    # 1. 聚合每日申购/赎回总额和用户行为结构
     user_balance["date"] = parse_date(user_balance["report_date"])
+    purchase_positive = user_balance["total_purchase_amt"] > 0
+    redeem_positive = user_balance["total_redeem_amt"] > 0
+    user_balance["transacting_user_count"] = (purchase_positive | redeem_positive).astype(int)
+    user_balance["purchase_user_count"] = purchase_positive.astype(int)
+    user_balance["redeem_user_count"] = redeem_positive.astype(int)
+    user_balance["both_user_count"] = (purchase_positive & redeem_positive).astype(int)
+    # 原始金额单位为分：100万元/500万元分别对应1万/5万元人民币。
+    user_balance["large_purchase_user_count"] = (user_balance["total_purchase_amt"] >= 1_000_000).astype(int)
+    user_balance["large_redeem_user_count"] = (user_balance["total_redeem_amt"] >= 1_000_000).astype(int)
+    user_balance["large_purchase_amt"] = user_balance["total_purchase_amt"].where(
+        user_balance["total_purchase_amt"] >= 1_000_000, 0
+    )
+    user_balance["large_redeem_amt"] = user_balance["total_redeem_amt"].where(
+        user_balance["total_redeem_amt"] >= 1_000_000, 0
+    )
+    user_balance["very_large_purchase_amt"] = user_balance["total_purchase_amt"].where(
+        user_balance["total_purchase_amt"] >= 5_000_000, 0
+    )
+    user_balance["very_large_redeem_amt"] = user_balance["total_redeem_amt"].where(
+        user_balance["total_redeem_amt"] >= 5_000_000, 0
+    )
     daily = (
         user_balance.groupby("date", as_index=False)
         .agg(
@@ -208,9 +220,23 @@ def main():
             redeem=("total_redeem_amt", "sum"),
             user_count=("user_id", "nunique") if "user_id" in user_balance.columns else ("report_date", "count"),
             record_count=("report_date", "count"),
+            transacting_user_count=("transacting_user_count", "sum"),
+            purchase_user_count=("purchase_user_count", "sum"),
+            redeem_user_count=("redeem_user_count", "sum"),
+            both_user_count=("both_user_count", "sum"),
+            large_purchase_user_count=("large_purchase_user_count", "sum"),
+            large_redeem_user_count=("large_redeem_user_count", "sum"),
+            large_purchase_amt=("large_purchase_amt", "sum"),
+            large_redeem_amt=("large_redeem_amt", "sum"),
+            very_large_purchase_amt=("very_large_purchase_amt", "sum"),
+            very_large_redeem_amt=("very_large_redeem_amt", "sum"),
+            purchase_bank_amt=("purchase_bank_amt", "sum"),
+            transfer_amt=("transfer_amt", "sum"),
         )
         .sort_values("date")
     )
+    daily["purchase_bank_share"] = daily["purchase_bank_amt"] / (daily["purchase"] + 1)
+    daily["transfer_redeem_share"] = daily["transfer_amt"] / (daily["redeem"] + 1)
 
     # 2. 合并收益率
     if "mfd_date" in share_interest.columns:
@@ -231,11 +257,13 @@ def main():
     daily = add_lag_rolling_features(daily)
     daily = add_same_period_features(daily)
     daily = add_ratio_diff_features(daily)
+    daily = add_behavior_history_features(daily)
 
     # 5. 简单缺失处理
     daily = daily.sort_values("date")
     numeric_cols = daily.select_dtypes(include=[np.number]).columns
-    daily[numeric_cols] = daily[numeric_cols].ffill().bfill()
+    # 时间序列只允许向前填充；bfill 会把未来观测传播到过去。
+    daily[numeric_cols] = daily[numeric_cols].ffill()
     # 剩余 NaN 用 0 填充（如 roll_std 在窗口不足时）
     daily[numeric_cols] = daily[numeric_cols].fillna(0)
 

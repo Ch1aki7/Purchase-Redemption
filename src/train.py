@@ -10,19 +10,27 @@ from .config import (
     FEATURE_COLUMNS_PATH,
     MODEL_PURCHASE_PATH,
     MODEL_REDEEM_PATH,
+    PURCHASE_MODEL_WEIGHT,
+    REDEEM_MODEL_WEIGHT,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_N_SEEDS,
+    DEFAULT_XGBOOST_PARAMS,
 )
 from .evaluate import evaluate_prediction
-from .predict import build_future_row
+from .ensemble import EnsembleModel
+from .predict import build_future_row, weekday_anchor
+from .calendar_features import CALENDAR_FEATURE_COLUMNS
+from .behavior_features import BEHAVIOR_BASE_COLUMNS
 
 
-def build_lightgbm(seed=42):
+def build_lightgbm(seed=42, **overrides):
     """LightGBM 调参版：更多树 + 小学习率 + 早停 + 正则化（第四轮调优实验最优配置）。
 
     第四轮调优实验发现：learning_rate=0.001, n_estimators=10000 比原配置
     (0.003, 5000) 略优，且配合多种子集成可进一步降低方差。
     """
     from lightgbm import LGBMRegressor
-    return LGBMRegressor(
+    params = dict(
         n_estimators=10000,
         learning_rate=0.001,
         num_leaves=31,
@@ -37,6 +45,8 @@ def build_lightgbm(seed=42):
         n_jobs=-1,
         verbose=-1,
     )
+    params.update(overrides)
+    return LGBMRegressor(**params)
 
 
 def build_rf():
@@ -60,10 +70,35 @@ def build_model():
 
 
 def get_feature_columns(df: pd.DataFrame):
-    exclude = {"date", "purchase", "redeem"}
+    # 同日用户行为在预测日不可获得，只允许其严格滞后的 behavior_* 派生特征入模。
+    exclude = {"date", "purchase", "redeem", "record_count"} | set(BEHAVIOR_BASE_COLUMNS) | {
+        "purchase_bank_amt", "transfer_amt"
+    }
     cols = [c for c in df.columns if c not in exclude]
     cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
+    # 多月份回测显示整组4/8/12周统计高度共线并导致过拟合；保留在特征文件中
+    # 供分析，但不直接输入树模型。稳定周周期由独立 weekday_anchor 使用。
+    rejected_weekday_stats = (
+        "_weekday_mean_", "_weekday_median_", "_weekday_std_"
+    )
+    cols = [c for c in cols if not any(token in c for token in rejected_weekday_stats)]
+    # 用户结构派生特征保留供分析；分组滚动回测均低于日历特征基线。
+    cols = [c for c in cols if not c.startswith("behavior_")]
     return cols
+
+
+def build_xgboost(seed=42, **overrides):
+    from xgboost import XGBRegressor
+
+    params = {
+        **DEFAULT_XGBOOST_PARAMS,
+        "objective": "reg:squarederror",
+        "random_state": seed,
+        "n_jobs": -1,
+        "early_stopping_rounds": 100,
+    }
+    params.update(overrides)
+    return XGBRegressor(**params)
 
 
 def fit_single_model(model, X_train, y_train, X_valid=None, y_valid=None, use_early_stop=False):
@@ -83,51 +118,6 @@ def fit_single_model(model, X_train, y_train, X_valid=None, y_valid=None, use_ea
             pass
     model.fit(X_train, y_train)
     return model
-
-
-class EnsembleModel:
-    """多种子 LightGBM 集成（第四轮调优发现纯LightGBM多种子平均最优）。
-
-    内部训练 n_seeds 个不同随机种子的 LightGBM，预测时取平均。
-    这比单模型方差更小，比加入 RandomForest 效果更好（RF 在该数据上贡献为负）。
-    含目标变换的预测还原能力。
-    """
-
-    def __init__(self, lgb_weight=1.0, rf_weight=0.0, n_seeds=3):
-        self.lgb_weight = lgb_weight
-        self.rf_weight = rf_weight
-        self.n_seeds = n_seeds
-        self.lgb_models = []
-        self.rf_model = None
-        self.use_ensemble = False  # 是否使用 RF
-
-    def fit(self, X_train, y_train, X_valid, y_valid):
-        # 多种子 LightGBM
-        self.lgb_models = []
-        for seed in range(42, 42 + self.n_seeds):
-            m = build_lightgbm(seed=seed)
-            m = fit_single_model(
-                m, X_train, y_train, X_valid, y_valid, use_early_stop=True
-            )
-            self.lgb_models.append(m)
-        # RandomForest 保留接口但不使用（调优实验证明权重0最优）
-        if self.rf_weight > 0:
-            try:
-                self.rf_model = build_rf()
-                self.rf_model.fit(X_train, y_train)
-                self.use_ensemble = True
-            except Exception as e:
-                print(f"RandomForest 训练失败：{e}")
-        return self
-
-    def predict(self, X):
-        # 多种子 LightGBM 平均
-        preds = [m.predict(X) for m in self.lgb_models]
-        lgb_pred = np.mean(preds, axis=0)
-        if not self.use_ensemble or self.rf_model is None or self.rf_weight == 0:
-            return lgb_pred
-        rf_pred = self.rf_model.predict(X)
-        return self.lgb_weight * lgb_pred + self.rf_weight * rf_pred
 
 
 def main():
@@ -155,13 +145,19 @@ def main():
     y_purchase_valid = np.log1p(valid_df["purchase"])
     y_redeem_valid = np.log1p(valid_df["redeem"])
 
-    # 训练集成模型（调参实验最优配置：纯LightGBM，权重1.0）
+    # 训练集成模型（多月份滚动回测最优：三种子浅层 XGBoost）
     print("训练申购集成模型...")
-    model_purchase = EnsembleModel(lgb_weight=1.0, rf_weight=0.0)
+    model_purchase = EnsembleModel(
+        lgb_weight=1.0, rf_weight=0.0, n_seeds=DEFAULT_N_SEEDS,
+        model_name=DEFAULT_MODEL_NAME, model_params=DEFAULT_XGBOOST_PARAMS,
+    )
     model_purchase.fit(X_train, y_purchase_train, X_valid, y_purchase_valid)
 
     print("训练赎回集成模型...")
-    model_redeem = EnsembleModel(lgb_weight=1.0, rf_weight=0.0)
+    model_redeem = EnsembleModel(
+        lgb_weight=1.0, rf_weight=0.0, n_seeds=DEFAULT_N_SEEDS,
+        model_name=DEFAULT_MODEL_NAME, model_params=DEFAULT_XGBOOST_PARAMS,
+    )
     model_redeem.fit(X_train, y_redeem_train, X_valid, y_redeem_valid)
 
     # 验证集采用滚动预测（与9月预测逻辑一致，避免使用8月真实历史导致分数虚高）
@@ -170,15 +166,16 @@ def main():
     # 构造8月外部变量：用7月均值（8月真实值在预测时未知，用过去信息）
     non_exog = {"date", "purchase", "redeem"}
     lag_roll_prefixes = ("purchase_lag_", "redeem_lag_", "purchase_roll_", "redeem_roll_",
-                         "purchase_same_", "redeem_same_", "purchase_diff_", "redeem_diff_",
-                         "net_inflow", "purchase_redeem_ratio")
+                          "purchase_same_", "redeem_same_", "purchase_diff_", "redeem_diff_",
+                          "purchase_weekday_", "redeem_weekday_",
+                          "net_inflow", "purchase_redeem_ratio")
     time_cols = {"dayofweek", "dayofmonth", "month", "is_weekend", "is_month_start", "is_month_end",
                  "dayofweek_sin", "dayofweek_cos", "dayofmonth_sin", "dayofmonth_cos",
                  "month_sin", "month_cos", "days_to_month_start", "days_to_month_end",
                  "is_first_3_days", "is_last_3_days", "is_first_7_days", "is_last_7_days",
                  "month_start_weight", "month_end_weight", "is_holiday",
                  "days_to_next_holiday", "days_from_last_holiday",
-                 "is_day_before_holiday", "is_day_after_holiday"}
+                 "is_day_before_holiday", "is_day_after_holiday"} | CALENDAR_FEATURE_COLUMNS
     exog_cols = [
         c for c in feature_cols
         if c not in non_exog and c not in time_cols and not c.startswith(lag_roll_prefixes)
@@ -197,15 +194,11 @@ def main():
 
     # 滚动预测8月
     history = train_df[["date", "purchase", "redeem"]].copy()
+    anchor_history = history.copy()
     valid_dates = pd.date_range("2014-08-01", "2014-08-31", freq="D")
     pred_rows = []
-    # 第五轮优化：月末3天上调（申购×1.2，赎回×1.3）
-    # 实验验证：零分日从9个减到6个，总分从5.19提升到5.43
-    # 原因：月末资金集中进出，模型系统性低估，上调后多数月末日误差降到30%以下
-    LAST3_P_BOOST = 1.2
-    LAST3_R_BOOST = 1.3
     for date in valid_dates:
-        X = build_future_row(date, history, feature_cols, exog_values_aug, df)
+        X = build_future_row(date, history, feature_cols, exog_values_aug, train_df)
         p_pred = float(np.expm1(model_purchase.predict(X)[0]))
         r_pred = float(np.expm1(model_redeem.predict(X)[0]))
         # 平滑修正：模型预测 × 0.99 + 近7日均值 × 0.01，缓解滚动漂移
@@ -214,11 +207,21 @@ def main():
         recent7_r = float(history["redeem"].tail(7).mean())
         p_pred = 0.99 * p_pred + 0.01 * recent7_p
         r_pred = 0.99 * r_pred + 0.01 * recent7_r
-        # 月末3天上调（第五轮优化）
-        dim = date.days_in_month
-        if date.day >= dim - 2:
-            p_pred *= LAST3_P_BOOST
-            r_pred *= LAST3_R_BOOST
+        # 保留模型自身的递归轨迹；周期锚点只修正最终输出，不反向扰动 lag。
+        p_recursive = float(np.clip(p_pred, p_lo, p_hi))
+        r_recursive = float(np.clip(r_pred, r_lo, r_hi))
+        p_pred = (
+            PURCHASE_MODEL_WEIGHT * p_recursive
+            + (1 - PURCHASE_MODEL_WEIGHT) * weekday_anchor(
+                date, anchor_history, "purchase"
+            )
+        )
+        r_pred = (
+            REDEEM_MODEL_WEIGHT * r_recursive
+            + (1 - REDEEM_MODEL_WEIGHT) * weekday_anchor(
+                date, anchor_history, "redeem"
+            )
+        )
         # 裁剪
         p_pred = float(np.clip(p_pred, p_lo, p_hi))
         r_pred = float(np.clip(r_pred, r_lo, r_hi))
@@ -228,7 +231,9 @@ def main():
         # 预测值回填为下一天的 lag 特征（关键：与9月预测一致）
         history = pd.concat([
             history,
-            pd.DataFrame({"date": [date], "purchase": [p_pred], "redeem": [r_pred]})
+            pd.DataFrame({
+                "date": [date], "purchase": [p_recursive], "redeem": [r_recursive]
+            })
         ], ignore_index=True)
 
     pred_df = pd.DataFrame(pred_rows)
@@ -248,7 +253,12 @@ def main():
     print("MAPE purchase:", mean_absolute_percentage_error(valid_result["purchase_true"], valid_result["purchase_pred"]))
     print("MAPE redeem:", mean_absolute_percentage_error(valid_result["redeem_true"], valid_result["redeem_pred"]))
 
-    # 保存集成模型对象
+    # 早停轮数由7月训练/8月验证确定；正式模型再使用截至8月底的全部数据重拟合。
+    X_full = df[feature_cols].fillna(0)
+    model_purchase.refit_full(X_full, np.log1p(df["purchase"]))
+    model_redeem.refit_full(X_full, np.log1p(df["redeem"]))
+
+    # 保存供9月预测使用的全量重拟合集成模型对象
     joblib.dump(model_purchase, MODEL_PURCHASE_PATH)
     joblib.dump(model_redeem, MODEL_REDEEM_PATH)
     with open(FEATURE_COLUMNS_PATH, "w", encoding="utf-8") as f:

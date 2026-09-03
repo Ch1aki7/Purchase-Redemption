@@ -130,6 +130,25 @@ def build_model(model_name: str, n_estimators: int, max_depth: int, learning_rat
             n_jobs=-1,
             verbose=-1,
         )
+    if model_name == "XGBoost":
+        try:
+            from xgboost import XGBRegressor
+        except Exception as exc:
+            raise RuntimeError("当前环境未安装 XGBoost，请先执行 pip install -r requirements.txt。") from exc
+        depth = 2 if max_depth == 0 else max_depth
+        return XGBRegressor(
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=depth,
+            min_child_weight=8,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_alpha=0.1,
+            reg_lambda=2.0,
+            objective="reg:squarederror",
+            random_state=random_state,
+            n_jobs=-1,
+        )
     raise ValueError(f"未知模型：{model_name}")
 
 
@@ -244,16 +263,18 @@ with st.sidebar:
             **一键运行完整流程使用 `src/train.py` 和 `src/predict.py` 中的固定正式配置，\
             不会读取下方交互训练区域的页面参数。**
 
-            - 训练数据：`2013-08-01` 至 `2014-07-31`
+            - 验证训练：`2013-08-01` 至 `2014-07-31`，用于滚动预测 8 月
+            - 正式模型：确定迭代轮数后，使用截至 `2014-08-31` 的全部数据重拟合
             - 本地验证：`2014-08-01` 至 `2014-08-31`，采用逐日滚动预测
             - 最终预测：`2014-09-01` 至 `2014-09-30`，逐日滚动预测并回填预测值
-            - 主模型：多种子 `LightGBM` 集成，申购和赎回分别训练
+            - 主模型：多种子浅层 `XGBoost` 集成，申购和赎回分别训练
             - 集成设置：`n_seeds=3`，随机种子为 `42、43、44`
-            - LightGBM 参数：`n_estimators=10000`，`learning_rate=0.001`，`num_leaves=31`，`max_depth=-1`
-            - 正则与采样：`min_child_samples=5`，`subsample=0.85`，`colsample_bytree=0.85`，`reg_alpha=0.05`，`reg_lambda=0.05`
+            - XGBoost 参数：`n_estimators=2000`，`learning_rate=0.02`，`max_depth=2`，`min_child_weight=8`
+            - 正则与采样：`subsample=0.85`，`colsample_bytree=0.85`，`reg_alpha=0.1`，`reg_lambda=2.0`
             - 目标变换：训练时使用 `log1p`，预测后使用 `expm1` 还原金额
             - 平滑修正：`预测值 × 0.99 + 近7日均值 × 0.01`
-            - 月末后处理：月末最后3天申购 `×1.2`，赎回 `×1.3`
+            - 周期融合：申购使用 `100%模型`，赎回使用 `50%模型 + 50%同星期均值`，同星期均值取预测前最近12期
+            - 月末策略：默认不做固定倍率修正；`×1.2/×1.3` 仅在滚动回测中作为实验策略比较
             - 外部变量：8月验证使用7月均值，9月预测使用8月均值
             - 输出文件：`output/daily_features.csv`、`output/data_quality_report.csv`、`output/validation_prediction.csv`、`output/tc_comp_predict_table.csv`、`models/*.pkl`
             """
@@ -348,7 +369,7 @@ with tab2:
     st.warning("交互训练用于课堂演示和模型/参数对比，结果只保存在当前会话，不覆盖 output/、models/ 或正式提交文件；正式评估结果以主流程滚动预测为准。")
 
     col1, col2, col3, col4 = st.columns(4)
-    model_name = col1.selectbox("模型", ["RandomForest", "GradientBoosting", "LightGBM"])
+    model_name = col1.selectbox("模型", ["XGBoost", "LightGBM", "RandomForest", "GradientBoosting"])
     n_estimators = col2.slider("树数量/训练轮数", min_value=20, max_value=500, value=100, step=20)
     max_depth = col3.slider("最大深度（0表示不限制/默认）", min_value=0, max_value=20, value=6, step=1)
     learning_rate = col4.select_slider("学习率", options=[0.001, 0.003, 0.005, 0.01, 0.03, 0.05, 0.1], value=0.03)
