@@ -9,6 +9,7 @@
 本项目包含：
 
 - 数据读取与预处理
+- 用户余额一致性校验，并输出数据质量报告
 - 每日申购/赎回聚合
 - 多维特征工程：周期傅里叶编码、月初月末连续特征、节假日特征、滞后/滚动统计、历史同期、比率差分（全部基于历史值，无数据泄露）
 - LightGBM 建模，滚动预测评估（验证集与9月预测逻辑一致）
@@ -40,6 +41,7 @@ Purchase-Redemption/
 │
 ├── output/                                   # 运行结果输出目录（运行后生成）
 │   ├── daily_features.csv                    # 预处理后的日级训练数据（含全部特征）
+│   ├── data_quality_report.csv               # 数据质量报告（余额一致性校验）
 │   ├── validation_prediction.csv             # 8月验证集预测结果（含真实值/预测值/误差）
 │   ├── tc_comp_predict_table.csv             # 9月最终预测提交文件（无表头，赛题格式）
 │   └── tc_comp_predict_table_with_header.csv # 9月预测带表头版本（便于查看）
@@ -77,6 +79,7 @@ Purchase-Redemption/
 | 文件 | 作用 | 生成阶段 |
 |---|---|---|
 | `daily_features.csv` | 预处理后的日级宽表，每行一天，包含 purchase/redeem 和113个特征 | `preprocess.py` 运行后 |
+| `data_quality_report.csv` | 数据质量报告，统计余额一致性校验结果 | `preprocess.py` 运行后 |
 | `validation_prediction.csv` | 8月验证集预测对比，含 date、purchase_true/pred、redeem_true/pred | `train.py` 运行后 |
 | `tc_comp_predict_table.csv` | 9月预测提交文件，无表头，格式为 `report_date,purchase,redeem`，共30行 | `predict.py` 运行后 |
 | `tc_comp_predict_table_with_header.csv` | 带表头版本，便于人工查看和可视化展示 | `predict.py` 运行后 |
@@ -130,6 +133,7 @@ output/tc_comp_predict_table.csv   赛题提交文件（30天预测）
 **阶段1：预处理与特征工程（`src/preprocess.py`）**
 
 - 从 `user_balance_table.csv` 按 `report_date` 聚合，得到每日 `purchase` 和 `redeem` 总量
+- 校验 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`，输出 `output/data_quality_report.csv`
 - 合并收益率表和 Shibor 利率表
 - 构造 113 个特征：周期傅里叶编码、月初月末连续特征、节假日、滞后/滚动统计、历史同期、比率差分
 - 输出 `output/daily_features.csv`
@@ -187,7 +191,7 @@ mfd_bank_shibor.csv
 
 **用户画像说明**：项目已读取 `user_profile_table`，但最终预测目标是每日申购/赎回总量，且测试期未来用户画像难以稳定映射到每日资金流；因此当前主模型未直接使用用户画像特征，而是在数据资产说明和可视化展示中保留其作用边界。
 
-**余额一致性说明**：指导书要求关注 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`。原始数据由赛题脱敏并保证业务一致性，项目文档中保留该约束说明；后续若需要，可在数据探索模块扩展为显式校验统计。
+**余额一致性说明**：指导书要求关注 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`。项目已在 `src/preprocess.py` 中实现该校验，并输出 `output/data_quality_report.csv`。该报告只用于数据质量说明，不删除样本、不改变训练和预测逻辑。
 
 ## 四、安装依赖
 
@@ -211,6 +215,7 @@ python run_all.py
 
 ```text
 output/daily_features.csv
+output/data_quality_report.csv
 output/validation_prediction.csv
 output/tc_comp_predict_table.csv
 output/tc_comp_predict_table_with_header.csv
@@ -224,6 +229,7 @@ models/feature_columns.json
 | 文件 | 作用 |
 |---|---|
 | `daily_features.csv` | 预处理和特征工程后的日级训练数据 |
+| `data_quality_report.csv` | 数据质量报告，记录余额一致性校验统计 |
 | `validation_prediction.csv` | 2014 年 8 月验证集预测结果，用于评估模型效果 |
 | `tc_comp_predict_table.csv` | 2014 年 9 月最终预测提交文件，默认无表头 |
 | `tc_comp_predict_table_with_header.csv` | 带表头版本，便于查看和展示 |
@@ -236,11 +242,12 @@ streamlit run app.py
 
 页面包括：
 
-1. 数据探索：展示历史申购/赎回趋势
-2. 模型评估：展示模型配置、优化路径、8 月验证集真实值与预测值对比
-3. 预测结果：展示 2014 年 9 月预测结果，并下载无表头提交文件
-4. 误差分析：展示验证集每日相对误差、零分日、高估/低估方向和异常类型
-5. 课程要求对照：对照指导书的数据预处理、建模预测、可视化和误差分析要求
+1. 数据探索：展示历史申购/赎回趋势、用户分布、收益率变化、Shibor 利率变化和数据质量报告
+2. 模型训练与评估：允许选择 RandomForest、GradientBoosting、LightGBM 及参数进行真实训练，并展示损失曲线、交叉验证和验证集对比
+3. 预测结果展示：展示 2014 年 9 月预测结果，并下载无表头提交文件，同时展示验证集每日误差和得分
+4. 误差分析：展示验证集绝对误差、相对误差、每日得分、零分日、高估/低估方向和改进提示
+
+侧边栏提供“一键运行完整流程”按钮，会执行 `run_all.py` 并重新生成 `output/` 与 `models/`；网页中的交互训练结果只保存在当前 Streamlit 会话中，不覆盖正式结果文件。
 
 如果首次运行 Streamlit 出现邮箱提示，直接按回车跳过即可。
 

@@ -12,6 +12,7 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from src.config import (
     DAILY_FEATURES_PATH,
+    DATA_QUALITY_REPORT_PATH,
     VALIDATION_PRED_PATH,
     SUBMISSION_WITH_HEADER_PATH,
     ROOT_DIR,
@@ -235,6 +236,26 @@ def get_display_validation(source_name: str):
 # =========================
 with st.sidebar:
     st.divider()
+    st.header("运行控制")
+    st.warning("一键运行完整流程会重新生成 output/ 下的特征、验证和预测文件，并覆盖 models/ 下的正式模型文件。")
+    if st.button("一键运行完整流程", type="secondary"):
+        with st.spinner("正在执行 run_all.py，可能需要几分钟..."):
+            result = subprocess.run(
+                [sys.executable, "run_all.py"],
+                cwd=ROOT_DIR,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        if result.returncode == 0:
+            st.success("完整流程运行完成，已刷新正式结果文件。")
+        else:
+            st.error("完整流程运行失败，请查看输出信息。")
+        with st.expander("运行输出"):
+            st.code((result.stdout or "") + "\n" + (result.stderr or ""))
+
+    st.divider()
     st.header("展示结果来源")
     source_options = ["主流程滚动预测结果"]
     if "interactive_valid" in st.session_state:
@@ -259,6 +280,13 @@ with tab1:
         c2.metric("特征列数", len(df.columns))
         c3.metric("日期范围", f"{df['date'].min().date()} ~ {df['date'].max().date()}")
         st.dataframe(df.head(20), use_container_width=True)
+
+        quality_report = read_csv_if_exists(DATA_QUALITY_REPORT_PATH)
+        if quality_report is not None:
+            st.markdown("### 数据质量校验")
+            st.caption("余额一致性校验：tBalance = yBalance + total_purchase_amt - total_redeem_amt")
+            st.dataframe(quality_report, use_container_width=True)
+
         fund_plot = df[["date", "purchase", "redeem"]].melt(id_vars="date", var_name="类型", value_name="金额")
         st.plotly_chart(px.line(fund_plot, x="date", y="金额", color="类型", title="历史申购/赎回趋势图"), use_container_width=True)
 
@@ -297,6 +325,7 @@ with tab2:
     st.subheader("模型训练与评估模块")
     st.markdown("### 选择模型和参数进行真实训练")
     st.info("本模块会在页面中真实训练申购模型和赎回模型，并把训练结果保存到当前 Streamlit 会话，用于后续预测对比和误差分析展示。")
+    st.warning("交互训练用于课堂演示和模型/参数对比，结果只保存在当前会话，不覆盖 output/、models/ 或正式提交文件；正式评估结果以主流程滚动预测为准。")
 
     col1, col2, col3, col4 = st.columns(4)
     model_name = col1.selectbox("模型", ["RandomForest", "GradientBoosting", "LightGBM"])
