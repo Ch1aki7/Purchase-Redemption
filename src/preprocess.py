@@ -57,6 +57,43 @@ def check_balance_consistency(user_balance: pd.DataFrame) -> pd.DataFrame:
             "mean_abs_error": float(valid_diff.abs().mean()) if total_valid_records else np.nan,
         }
     ])
+
+
+def check_component_consistency(daily: pd.DataFrame) -> pd.DataFrame:
+    """校验聚合后的资金流拆分恒等关系。"""
+    checks = [
+        ("purchase_segment_consistency", "purchase", ["large_user_purchase", "small_user_purchase"]),
+        ("redeem_segment_consistency", "redeem", ["large_user_redeem", "small_user_redeem"]),
+        ("redeem_component_consistency", "redeem", ["consume_amt", "transfer_amt"]),
+    ]
+    rows = []
+    for name, total_col, component_cols in checks:
+        missing = [col for col in [total_col, *component_cols] if col not in daily.columns]
+        if missing:
+            rows.append({
+                "check_item": name,
+                "status": "skipped",
+                "message": f"缺少字段：{', '.join(missing)}",
+                "total_records": len(daily),
+            })
+            continue
+        diff = daily[total_col] - daily[component_cols].sum(axis=1)
+        consistent = diff.abs() <= 1e-6
+        rows.append({
+            "check_item": name,
+            "status": "passed" if bool(consistent.all()) else "warning",
+            "message": f"校验 {total_col} = {' + '.join(component_cols)}",
+            "total_records": int(len(daily)),
+            "valid_records": int(len(daily)),
+            "consistent_records": int(consistent.sum()),
+            "inconsistent_records": int((~consistent).sum()),
+            "inconsistent_ratio": float((~consistent).mean()),
+            "max_abs_error": float(diff.abs().max()),
+            "mean_abs_error": float(diff.abs().mean()),
+        })
+    return pd.DataFrame(rows)
+
+
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["dayofweek"] = df["date"].dt.dayofweek
@@ -183,22 +220,43 @@ def main():
             raise ValueError(f"user_balance_table 缺少必要字段：{col}")
 
     quality_report = check_balance_consistency(user_balance)
-    DATA_QUALITY_REPORT_PATH.parent.mkdir(exist_ok=True)
-    quality_report.to_csv(DATA_QUALITY_REPORT_PATH, index=False, encoding="utf-8-sig")
-    print(f"数据质量报告已生成：{DATA_QUALITY_REPORT_PATH}")
-    if "inconsistent_records" in quality_report.columns:
-        inconsistent_records = quality_report.loc[0, "inconsistent_records"]
-        print(f"余额一致性异常记录数：{inconsistent_records}")
 
     # 1. 聚合每日申购/赎回总额和用户行为结构
     user_balance["date"] = parse_date(user_balance["report_date"])
+    amount_cols = [
+        "total_purchase_amt", "total_redeem_amt", "consume_amt", "transfer_amt",
+        "purchase_bank_amt",
+    ]
+    for col in amount_cols:
+        if col not in user_balance.columns:
+            user_balance[col] = 0.0
+        user_balance[col] = pd.to_numeric(user_balance[col], errors="coerce").fillna(0.0)
+
+    # 参考优胜方案按大/小用户分解资金流。分类仅使用截至当天的累计历史，
+    # 不使用用户在未来日期的行为，保证滚动回测时不存在未来信息泄漏。
+    large_user_threshold = 5_000_000
+    if "user_id" in user_balance.columns:
+        user_balance = user_balance.sort_values(["user_id", "date"])
+        historical_max_redeem = user_balance.groupby("user_id", sort=False)["total_redeem_amt"].cummax()
+    else:
+        historical_max_redeem = user_balance["total_redeem_amt"]
+    user_balance["is_large_user"] = (historical_max_redeem >= large_user_threshold).astype(int)
+
     purchase_positive = user_balance["total_purchase_amt"] > 0
     redeem_positive = user_balance["total_redeem_amt"] > 0
     user_balance["transacting_user_count"] = (purchase_positive | redeem_positive).astype(int)
     user_balance["purchase_user_count"] = purchase_positive.astype(int)
     user_balance["redeem_user_count"] = redeem_positive.astype(int)
     user_balance["both_user_count"] = (purchase_positive & redeem_positive).astype(int)
-    # 原始金额单位为分：100万元/500万元分别对应1万/5万元人民币。
+    active = purchase_positive | redeem_positive
+    user_balance["large_active_user_count"] = (active & user_balance["is_large_user"].eq(1)).astype(int)
+    user_balance["small_active_user_count"] = (active & user_balance["is_large_user"].eq(0)).astype(int)
+    for flow in ["purchase", "redeem"]:
+        source = f"total_{flow}_amt"
+        user_balance[f"large_user_{flow}"] = user_balance[source].where(user_balance["is_large_user"].eq(1), 0)
+        user_balance[f"small_user_{flow}"] = user_balance[source].where(user_balance["is_large_user"].eq(0), 0)
+
+    # 交易级阈值特征；原始金额单位与赛题提交口径一致，不做擅自换算。
     user_balance["large_purchase_user_count"] = (user_balance["total_purchase_amt"] >= 1_000_000).astype(int)
     user_balance["large_redeem_user_count"] = (user_balance["total_redeem_amt"] >= 1_000_000).astype(int)
     user_balance["large_purchase_amt"] = user_balance["total_purchase_amt"].where(
@@ -218,12 +276,20 @@ def main():
         .agg(
             purchase=("total_purchase_amt", "sum"),
             redeem=("total_redeem_amt", "sum"),
+            consume_amt=("consume_amt", "sum"),
+            transfer_amt=("transfer_amt", "sum"),
+            large_user_purchase=("large_user_purchase", "sum"),
+            small_user_purchase=("small_user_purchase", "sum"),
+            large_user_redeem=("large_user_redeem", "sum"),
+            small_user_redeem=("small_user_redeem", "sum"),
             user_count=("user_id", "nunique") if "user_id" in user_balance.columns else ("report_date", "count"),
             record_count=("report_date", "count"),
             transacting_user_count=("transacting_user_count", "sum"),
             purchase_user_count=("purchase_user_count", "sum"),
             redeem_user_count=("redeem_user_count", "sum"),
             both_user_count=("both_user_count", "sum"),
+            large_active_user_count=("large_active_user_count", "sum"),
+            small_active_user_count=("small_active_user_count", "sum"),
             large_purchase_user_count=("large_purchase_user_count", "sum"),
             large_redeem_user_count=("large_redeem_user_count", "sum"),
             large_purchase_amt=("large_purchase_amt", "sum"),
@@ -231,12 +297,27 @@ def main():
             very_large_purchase_amt=("very_large_purchase_amt", "sum"),
             very_large_redeem_amt=("very_large_redeem_amt", "sum"),
             purchase_bank_amt=("purchase_bank_amt", "sum"),
-            transfer_amt=("transfer_amt", "sum"),
         )
         .sort_values("date")
     )
+    active_denominator = daily["transacting_user_count"].clip(lower=1)
+    daily["purchase_per_active_user"] = daily["purchase"] / active_denominator
+    daily["redeem_per_active_user"] = daily["redeem"] / active_denominator
+    daily["consume_per_active_user"] = daily["consume_amt"] / active_denominator
+    daily["transfer_per_active_user"] = daily["transfer_amt"] / active_denominator
+    daily["large_purchase_per_active_user"] = daily["large_user_purchase"] / daily["large_active_user_count"].clip(lower=1)
+    daily["small_purchase_per_active_user"] = daily["small_user_purchase"] / daily["small_active_user_count"].clip(lower=1)
+    daily["large_redeem_per_active_user"] = daily["large_user_redeem"] / daily["large_active_user_count"].clip(lower=1)
+    daily["small_redeem_per_active_user"] = daily["small_user_redeem"] / daily["small_active_user_count"].clip(lower=1)
     daily["purchase_bank_share"] = daily["purchase_bank_amt"] / (daily["purchase"] + 1)
     daily["transfer_redeem_share"] = daily["transfer_amt"] / (daily["redeem"] + 1)
+
+    quality_report = pd.concat(
+        [quality_report, check_component_consistency(daily)], ignore_index=True, sort=False
+    )
+    DATA_QUALITY_REPORT_PATH.parent.mkdir(exist_ok=True)
+    quality_report.to_csv(DATA_QUALITY_REPORT_PATH, index=False, encoding="utf-8-sig")
+    print(f"数据质量报告已生成：{DATA_QUALITY_REPORT_PATH}")
 
     # 2. 合并收益率
     if "mfd_date" in share_interest.columns:

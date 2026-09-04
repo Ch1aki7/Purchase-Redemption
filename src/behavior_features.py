@@ -21,6 +21,28 @@ BEHAVIOR_BASE_COLUMNS = (
 )
 
 
+# 当日资金流组成与人均指标只能作为结构模型目标或展示字段，
+# 不得直接输入预测当天的机器学习模型，也无需批量生成未采用的行为特征。
+STRUCTURAL_TARGET_COLUMNS = (
+    "consume_amt",
+    "transfer_amt",
+    "large_user_purchase",
+    "small_user_purchase",
+    "large_user_redeem",
+    "small_user_redeem",
+    "large_active_user_count",
+    "small_active_user_count",
+    "purchase_per_active_user",
+    "redeem_per_active_user",
+    "consume_per_active_user",
+    "transfer_per_active_user",
+    "large_purchase_per_active_user",
+    "small_purchase_per_active_user",
+    "large_redeem_per_active_user",
+    "small_redeem_per_active_user",
+)
+
+
 def add_behavior_history_features(df):
     """Create features that only use observations strictly before each row."""
     df = df.sort_values("date").copy()

@@ -37,6 +37,12 @@ TIME_COLUMNS = {
     "days_from_last_holiday", "is_day_before_holiday", "is_day_after_holiday",
 } | CALENDAR_FEATURE_COLUMNS
 
+STAGE_MONTHS = {
+    "development": ["2014-04", "2014-05", "2014-06", "2014-07"],
+    "confirm": ["2014-08"],
+    "all": ["2014-04", "2014-05", "2014-06", "2014-07", "2014-08"],
+}
+
 
 class MeanModel:
     """Prediction-only ensemble used by the backtest."""
@@ -323,9 +329,12 @@ def evaluate_fold(
 def parse_args():
     parser = argparse.ArgumentParser(description="按月执行扩展窗口递归滚动回测")
     parser.add_argument(
+        "--stage", choices=list(STAGE_MONTHS), default="all",
+        help="development用于参数筛选；confirm仅评估8月；all用于冻结方案后的完整报告",
+    )
+    parser.add_argument(
         "--months", nargs="+",
-        default=["2014-04", "2014-05", "2014-06", "2014-07", "2014-08"],
-        help="回测月份，例如 --months 2014-06 2014-07 2014-08",
+        help="自定义回测月份；提供后覆盖 --stage 的默认月份",
     )
     parser.add_argument(
         "--n-seeds", type=int, default=1,
@@ -356,7 +365,9 @@ def main():
     df = pd.read_csv(DAILY_FEATURES_PATH, parse_dates=["date"]).sort_values("date")
     df = df[df["date"] >= pd.Timestamp("2013-08-01")].copy()
     feature_cols = get_feature_columns(df)
-    periods = [pd.Period(value, freq="M") for value in args.months]
+    month_values = args.months or STAGE_MONTHS[args.stage]
+    evaluation_stage = "custom" if args.months else args.stage
+    periods = [pd.Period(value, freq="M") for value in month_values]
 
     prediction_frames = []
     metric_rows = []
@@ -366,16 +377,27 @@ def main():
             args.model, args.preset
         )
         prediction_frames.extend(fold_predictions)
+        for row in fold_metrics:
+            row["evaluation_stage"] = evaluation_stage
         metric_rows.extend(fold_metrics)
 
     predictions = pd.concat(prediction_frames, ignore_index=True)
     metrics = pd.DataFrame(metric_rows)
     for strategy, group in predictions.groupby("strategy"):
         overall = evaluate_prediction(group)
+        strategy_folds = metrics[metrics["strategy"] == strategy]
+        worst_index = strategy_folds["risk_adjusted_loss"].idxmax()
+        worst_fold = strategy_folds.loc[worst_index]
         metrics = pd.concat([
             metrics,
             pd.DataFrame([{
-                "fold": "overall", "strategy": strategy, **overall,
+                "fold": "overall", "strategy": strategy,
+                "evaluation_stage": evaluation_stage, **overall,
+                "worst_fold": str(worst_fold["fold"]),
+                "worst_fold_risk_adjusted_loss": float(worst_fold["risk_adjusted_loss"]),
+                "fold_risk_adjusted_loss_std": float(strategy_folds["risk_adjusted_loss"].std(ddof=0)),
+                "worst_fold_flow_mape": float(strategy_folds["flow_mape"].max()),
+                "fold_flow_mape_std": float(strategy_folds["flow_mape"].std(ddof=0)),
                 "purchase_zero_score_days": int((group["purchase_error"] > 0.3).sum()),
                 "redeem_zero_score_days": int((group["redeem_error"] > 0.3).sum()),
                 "purchase_best_iterations": "", "redeem_best_iterations": "",
@@ -386,7 +408,10 @@ def main():
     predictions.to_csv(BACKTEST_PRED_PATH, index=False, encoding="utf-8-sig")
     metrics.to_csv(BACKTEST_METRICS_PATH, index=False, encoding="utf-8-sig")
     print("\n回测汇总：")
-    print(metrics[["fold", "strategy", "purchase_mape", "redeem_mape", "total_score"]].to_string(index=False))
+    print(metrics[[
+        "fold", "strategy", "flow_mape", "tail_p90",
+        "severe_30_ratio", "risk_adjusted_loss", "total_score",
+    ]].to_string(index=False))
     print(f"\n逐日结果：{BACKTEST_PRED_PATH}")
     print(f"指标汇总：{BACKTEST_METRICS_PATH}")
 

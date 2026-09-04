@@ -78,6 +78,7 @@ Purchase-Redemption/
 | `behavior_features.py` | 生成用户交易人数、大额交易和渠道占比的严格历史统计 | `add_behavior_history_features()` |
 | `train.py` | 训练3种子浅层 XGBoost 集成模型，用8月做递归验证 | `build_xgboost()` |
 | `backtest.py` | 比较模型、目标形式和实验策略 | `run_backtest()` |
+| `auto_tune.py` | 随机生成大量模型参数并复用预测测试平滑/周期权重，支持断点续跑 | `evaluate_model_config()` |
 | `predict.py` | 对9月30天做滚动预测，生成赛题提交格式文件 | `rolling_predict()` |
 | `evaluate.py` | 计算 MAPE 和模拟评分，供训练和可视化共用 | `evaluate_prediction()` |
 
@@ -324,7 +325,7 @@ streamlit run app.py
 
 ## 十、滚动回测
 
-为避免只在 2014 年 8 月上调参导致结论偏乐观，可以对多个历史月份执行扩展窗口回测。每个回测折只使用目标月份之前的数据；目标月内逐日递归预测，并把预测值回填为后续日期的滞后特征。
+为避免只在 2014 年 8 月上调参导致结论偏乐观，可以对多个历史月份执行扩展窗口回测。每个回测折只使用目标月份之前的数据；目标月内逐日递归预测，并把预测值回填为后续日期的滞后特征。新选型优先使用加权 MAPE、P90 尾部误差、超过20%/30%的严重错误比例和风险调整损失；旧模拟分仅保留兼容展示。
 
 快速回测默认使用 1 个浅层 XGBoost 随机种子，评估 2014 年 4 月至 8 月：
 
@@ -337,6 +338,15 @@ python -m src.backtest
 ```bash
 python -m src.backtest --n-seeds 3
 ```
+
+参数筛选与独立确认应分开执行：
+
+```bash
+python -m src.backtest --stage development --n-seeds 3
+python -m src.backtest --stage confirm --n-seeds 3
+```
+
+`development` 只包含2014年4—7月，`confirm` 只包含2014年8月；不指定时使用 `all` 生成完整五个月报告。
 
 也可以指定月份：
 
@@ -378,3 +388,56 @@ output/rolling_backtest_metrics.csv
 | 目标分别融合 | 申购不融合，赎回50%模型+50%周期锚点整体最好 | 是 |
 
 以上数值均为项目自定义线性近似评分，不是天池官方成绩。
+
+## 十一、自动调参与批量记录
+
+自动调参使用与正式流程一致的无泄露扩展窗口递归回测。模型参数采用可复现的随机搜索；同一批模型预测会复用到多组平滑权重和星期周期融合权重中，减少重复训练。
+
+先查看默认快速档的测试规模，不执行训练：
+
+```bash
+python -m src.auto_tune --dry-run
+```
+
+快速筛选默认测试8组XGBoost模型参数、2014年7—8月以及192个完整候选组合：
+
+```bash
+python -m src.auto_tune
+```
+
+大规模搜索默认测试30组模型参数、2014年4—8月以及2160个完整候选组合：
+
+```bash
+python -m src.auto_tune --profile large
+```
+
+同时比较XGBoost和LightGBM：
+
+```bash
+python -m src.auto_tune --profile large --models both
+```
+
+自定义搜索规模和后处理参数：
+
+```bash
+python -m src.auto_tune --trials 20 --months 2014-04 2014-05 2014-06 2014-07 2014-08 --smooth-weights 0.97,0.99,1.0 --purchase-weights 0.95,1.0 --redeem-weights 0.35,0.5,0.65,0.8 --n-seeds 1
+```
+
+结果会在每完成一组模型参数后立即写入，程序中断后执行同一命令会自动跳过已完成组合。只有明确希望清空同名结果重新计算时才加入 `--no-resume`。
+
+输出文件位于 `output/tuning/`：
+
+| 文件 | 内容 |
+|---|---|
+| `auto_tune_results.csv` | 每个完整参数组合的整体分数、MAPE、最差月份、月份间标准差、零分日和耗时 |
+| `auto_tune_fold_metrics.csv` | 每个候选在各回测月份的详细指标及早停轮数 |
+| `auto_tune_best.json` | 当前总分最高参数，便于复制到前端正式评估做3种子复核 |
+| `auto_tune_failures.csv` | 失败配置和异常信息；只有出现失败时生成 |
+
+建议先用单种子大规模筛选，再把排名靠前且最差月份表现稳定的参数复制到网页“正式滚动评估”，改为3个随机种子复核并下载提交文件。不要仅按8月单月最高分选择参数。
+
+也可以直接读取当前最佳参数JSON，在完整五个月上进行3种子复核；该模式只训练一个模型参数配置，并默认复用JSON中的平滑和融合权重：
+
+```bash
+python -m src.auto_tune --profile large --params-json output/tuning/auto_tune_best.json --n-seeds 3 --output-dir output/tuning_confirm
+```

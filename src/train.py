@@ -20,7 +20,7 @@ from .evaluate import evaluate_prediction
 from .ensemble import EnsembleModel
 from .predict import build_future_row, weekday_anchor
 from .calendar_features import CALENDAR_FEATURE_COLUMNS
-from .behavior_features import BEHAVIOR_BASE_COLUMNS
+from .behavior_features import BEHAVIOR_BASE_COLUMNS, STRUCTURAL_TARGET_COLUMNS
 
 
 def build_lightgbm(seed=42, **overrides):
@@ -71,7 +71,7 @@ def build_model():
 
 def get_feature_columns(df: pd.DataFrame):
     # 同日用户行为在预测日不可获得，只允许其严格滞后的 behavior_* 派生特征入模。
-    exclude = {"date", "purchase", "redeem", "record_count"} | set(BEHAVIOR_BASE_COLUMNS) | {
+    exclude = {"date", "purchase", "redeem", "record_count"} | set(BEHAVIOR_BASE_COLUMNS) | set(STRUCTURAL_TARGET_COLUMNS) | {
         "purchase_bank_amt", "transfer_amt"
     }
     cols = [c for c in df.columns if c not in exclude]

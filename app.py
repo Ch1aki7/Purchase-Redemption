@@ -14,7 +14,11 @@ from src.config import (
     DAILY_FEATURES_PATH,
     DATA_QUALITY_REPORT_PATH,
     VALIDATION_PRED_PATH,
+    BACKTEST_METRICS_PATH,
     SUBMISSION_WITH_HEADER_PATH,
+    STRUCTURAL_BACKTEST_METRICS_PATH,
+    STRUCTURAL_VALIDATION_PATH,
+    STRUCTURAL_SUBMISSION_WITH_HEADER_PATH,
     ROOT_DIR,
     DATA_DIR,
 )
@@ -25,6 +29,7 @@ from src.backtest import (
     recursive_forecast,
     train_refitted_ensemble,
 )
+from src.structural_model import StructuralFlowForecaster, StructuralParams
 
 st.set_page_config(page_title="资金流入流出预测系统", layout="wide")
 st.title("资金流入流出预测系统")
@@ -64,8 +69,8 @@ def read_raw_table(keyword: str):
 
 
 def get_feature_columns(df: pd.DataFrame):
-    exclude = {"date", "purchase", "redeem"}
-    return [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+    # 与正式训练完全共用筛选规则，避免当日分群金额、人数和人均金额泄漏目标。
+    return get_formal_feature_columns(df)
 
 
 def classify_anomaly(date):
@@ -95,7 +100,8 @@ def enrich_prediction_result(valid: pd.DataFrame) -> pd.DataFrame:
     valid["daily_weighted_score"] = valid["purchase_score"] * 0.45 + valid["redeem_score"] * 0.55
     valid["purchase_direction"] = np.where(valid["purchase_pred"] > valid["purchase_true"], "高估", "低估")
     valid["redeem_direction"] = np.where(valid["redeem_pred"] > valid["redeem_true"], "高估", "低估")
-    valid["is_zero_score_day"] = (valid["purchase_error"] > 0.3) | (valid["redeem_error"] > 0.3)
+    valid["is_severe_error_day"] = (valid["purchase_error"] > 0.3) | (valid["redeem_error"] > 0.3)
+    valid["is_zero_score_day"] = valid["is_severe_error_day"]  # 兼容旧页面字段
     valid["异常类型"] = valid["date"].apply(classify_anomaly)
     return valid
 
@@ -274,7 +280,7 @@ def run_formal_evaluation(
     redeem_model, redeem_iterations = train_refitted_ensemble(
         history, feature_cols, "redeem", n_seeds,
         model_name=model_name, preset="default", model_params=model_params,
-        start_seed=random_state + 100,
+        start_seed=random_state,
     )
     validation_prediction = recursive_forecast(
         purchase_model, redeem_model, history,
@@ -303,7 +309,7 @@ def run_formal_evaluation(
     final_redeem_model, final_redeem_iterations = train_refitted_ensemble(
         df, feature_cols, "redeem", n_seeds,
         model_name=model_name, preset="default", model_params=model_params,
-        start_seed=random_state + 100,
+        start_seed=random_state,
     )
     september = pd.Period("2014-09", freq="M")
     september_prediction = recursive_forecast(
@@ -333,6 +339,11 @@ def run_formal_evaluation(
 
 
 def get_display_validation(source_name: str):
+    if source_name == "结构化模型（8月验证）":
+        valid = read_csv_if_exists(STRUCTURAL_VALIDATION_PATH)
+        return enrich_prediction_result(valid) if valid is not None else None
+    if source_name == "本次结构模型调参" and "structural_valid" in st.session_state:
+        return st.session_state["structural_valid"].copy()
     if source_name == "本次正式调参评估" and "formal_valid" in st.session_state:
         return st.session_state["formal_valid"].copy()
     if source_name == "本次交互训练结果" and "interactive_valid" in st.session_state:
@@ -341,6 +352,41 @@ def get_display_validation(source_name: str):
     if valid is None:
         return None
     return enrich_prediction_result(valid)
+
+
+def run_structural_session(mode, params, stage="development"):
+    """会话内执行开发折或独立确认，不覆盖项目正式输出。"""
+    data = pd.read_csv(DAILY_FEATURES_PATH, parse_dates=["date"]).sort_values("date")
+    data = data[data["date"] >= pd.Timestamp("2013-08-01")].copy()
+    stage_months = {
+        "development": ["2014-04", "2014-05", "2014-06", "2014-07"],
+        "confirm": ["2014-08"],
+    }
+    validation_frames = []
+    for month in stage_months[stage]:
+        period = pd.Period(month, freq="M")
+        train = data[data["date"] < period.start_time]
+        actual = data[data["date"].dt.to_period("M") == period]
+        fold = StructuralFlowForecaster(mode, params).fit(train).predict(actual["date"])
+        fold = fold.merge(
+            actual[["date", "purchase", "redeem"]].rename(
+                columns={"purchase": "purchase_true", "redeem": "redeem_true"}
+            ), on="date", how="inner",
+        )
+        fold["fold"] = month
+        validation_frames.append(fold)
+    validation = pd.concat(validation_frames, ignore_index=True)
+    validation = enrich_prediction_result(validation)
+    if stage != "confirm":
+        return validation, None
+    future_dates = pd.date_range("2014-09-01", "2014-09-30", freq="D")
+    future = StructuralFlowForecaster(mode, params).fit(data).predict(future_dates)
+    submission = future.assign(
+        report_date=future["date"].dt.strftime("%Y%m%d").astype(int),
+        purchase=future["purchase_pred"].round().clip(lower=0).astype("int64"),
+        redeem=future["redeem_pred"].round().clip(lower=0).astype("int64"),
+    )[["report_date", "purchase", "redeem"]]
+    return validation, submission
 
 
 # =========================
@@ -392,6 +438,10 @@ with st.sidebar:
     st.divider()
     st.header("展示结果来源")
     source_options = ["主流程滚动预测结果"]
+    if STRUCTURAL_VALIDATION_PATH.exists():
+        source_options.append("结构化模型（8月验证）")
+    if "structural_valid" in st.session_state:
+        source_options.append("本次结构模型调参")
     if "formal_valid" in st.session_state:
         source_options.append("本次正式调参评估")
     if "interactive_valid" in st.session_state:
@@ -426,40 +476,140 @@ with tab1:
         fund_plot = df[["date", "purchase", "redeem"]].melt(id_vars="date", var_name="类型", value_name="金额")
         st.plotly_chart(px.line(fund_plot, x="date", y="金额", color="类型", title="历史申购/赎回趋势图"), use_container_width=True)
 
-        yield_cols = [c for c in ["mfd_daily_yield", "mfd_7daily_yield"] if c in df.columns]
-        if yield_cols:
-            yield_plot = df[["date"] + yield_cols].melt("date", var_name="收益率字段", value_name="数值")
-            st.plotly_chart(px.line(yield_plot, x="date", y="数值", color="收益率字段", title="收益率变化图"), use_container_width=True)
+        component_cols = [c for c in ["consume_amt", "transfer_amt"] if c in df.columns]
+        if component_cols:
+            component_plot = df[["date"] + component_cols].melt("date", var_name="赎回组成", value_name="金额")
+            st.plotly_chart(px.area(component_plot, x="date", y="金额", color="赎回组成", title="赎回组成：消费与转出"), use_container_width=True)
 
-        shibor_cols = [c for c in df.columns if c.startswith("Interest_")]
-        if shibor_cols:
-            chosen_shibor = st.multiselect("选择要展示的 Shibor 指标", shibor_cols, default=shibor_cols[: min(3, len(shibor_cols))])
-            if chosen_shibor:
-                shibor_plot = df[["date"] + chosen_shibor].melt("date", var_name="Shibor字段", value_name="利率")
-                st.plotly_chart(px.line(shibor_plot, x="date", y="利率", color="Shibor字段", title="Shibor 利率变化图"), use_container_width=True)
+        segment_cols = [
+            c for c in ["large_user_purchase", "small_user_purchase", "large_user_redeem", "small_user_redeem"]
+            if c in df.columns
+        ]
+        if segment_cols:
+            segment_plot = df[["date"] + segment_cols].melt("date", var_name="用户分群资金流", value_name="金额")
+            st.plotly_chart(px.line(segment_plot, x="date", y="金额", color="用户分群资金流", title="因果大/小用户资金流"), use_container_width=True)
 
-    profile = read_raw_table("user_profile")
-    if profile is None:
-        st.info("未找到用户画像原始表，用户分布图需要解压原始数据后展示。")
-    else:
-        st.markdown("### 用户分布")
-        col1, col2, col3 = st.columns(3)
-        if "sex" in profile.columns:
-            sex_counts = profile["sex"].fillna("未知").astype(str).value_counts().reset_index()
-            sex_counts.columns = ["性别", "人数"]
-            col1.plotly_chart(px.pie(sex_counts, names="性别", values="人数", title="性别分布"), use_container_width=True)
-        if "city" in profile.columns:
-            city_counts = profile["city"].fillna("未知").astype(str).value_counts().head(10).reset_index()
-            city_counts.columns = ["城市", "人数"]
-            col2.plotly_chart(px.bar(city_counts, x="城市", y="人数", title="城市Top10"), use_container_width=True)
-        if "constellation" in profile.columns:
-            cons_counts = profile["constellation"].fillna("未知").astype(str).value_counts().reset_index()
-            cons_counts.columns = ["星座", "人数"]
-            col3.plotly_chart(px.bar(cons_counts, x="星座", y="人数", title="星座分布"), use_container_width=True)
+        behavior_cols = [c for c in ["transacting_user_count", "large_active_user_count", "small_active_user_count"] if c in df.columns]
+        if behavior_cols:
+            behavior_plot = df[["date"] + behavior_cols].melt("date", var_name="活跃用户", value_name="人数")
+            st.plotly_chart(px.line(behavior_plot, x="date", y="人数", color="活跃用户", title="活跃用户规模"), use_container_width=True)
+
+        with st.expander("查看收益率与 Shibor 辅助变量"):
+            auxiliary_cols = [c for c in ["mfd_daily_yield", "mfd_7daily_yield"] if c in df.columns]
+            auxiliary_cols += [c for c in df.columns if c.startswith("Interest_")][:3]
+            if auxiliary_cols:
+                auxiliary_plot = df[["date"] + auxiliary_cols].melt("date", var_name="字段", value_name="数值")
+                st.plotly_chart(px.line(auxiliary_plot, x="date", y="数值", color="字段"), use_container_width=True)
+            else:
+                st.info("当前特征文件中没有辅助利率变量。")
 
 with tab2:
     st.subheader("模型训练与评估模块")
-    st.markdown("### 选择模型和参数进行真实训练")
+    st.markdown("### 统一滚动回测对照")
+    comparison_frames = []
+    baseline_metrics = read_csv_if_exists(BACKTEST_METRICS_PATH)
+    if baseline_metrics is not None:
+        baseline_metrics = baseline_metrics[baseline_metrics["fold"] == "overall"].copy()
+        baseline_metrics["model_family"] = "机器学习基线"
+        comparison_frames.append(baseline_metrics)
+    structural_metrics = read_csv_if_exists(STRUCTURAL_BACKTEST_METRICS_PATH)
+    if structural_metrics is not None:
+        structural_metrics = structural_metrics[structural_metrics["fold"] == "overall"].copy()
+        structural_metrics["model_family"] = "结构化非递归"
+        comparison_frames.append(structural_metrics)
+    if comparison_frames:
+        comparison = pd.concat(comparison_frames, ignore_index=True).sort_values("risk_adjusted_loss")
+        st.dataframe(
+            comparison[[
+                "evaluation_stage", "model_family", "strategy", "flow_mape",
+                "tail_p90", "severe_30_ratio", "risk_adjusted_loss", "total_score",
+            ]],
+            use_container_width=True,
+        )
+        st.caption("风险调整损失越低越好；模拟分只保留为兼容指标。development用于选型，confirm只用于冻结方案后的8月确认。")
+        with st.expander("分阶段回测命令"):
+            st.code(
+                "python -m src.backtest --stage development --n-seeds 3\n"
+                "python -m src.backtest --stage confirm --n-seeds 3\n"
+                "python -m src.structural_backtest --stage development\n"
+                "python -m src.structural_backtest --stage confirm",
+                language="bash",
+            )
+    else:
+        st.info("尚无滚动回测结果，请先运行完整流程和结构模型回测。")
+
+    st.markdown("### 结构模型手动调参（仅当前会话）")
+    st.caption("模型在 log1p 空间实现趋势 × 星期 × 标准化月内位置 × 节假日效应，并一次性直接预测整月。")
+    with st.form("structural_tuning_form"):
+        structural_stage = st.radio(
+            "评估阶段",
+            ["development", "confirm"],
+            format_func={
+                "development": "开发折：2014-04至07（用于调参）",
+                "confirm": "独立确认：2014-08（冻结参数后使用）",
+            }.get,
+            horizontal=True,
+        )
+        s1, s2, s3, s4 = st.columns(4)
+        structural_mode = s1.selectbox(
+            "分解方式",
+            list(StructuralFlowForecaster.MODES),
+            format_func={
+                "total": "直接预测总额",
+                "user_segment": "大/小用户分别预测",
+                "flow_component": "消费/转出分别预测",
+                "per_active_user": "活跃人数×人均金额",
+            }.get,
+        )
+        trend_window = s2.slider("趋势观察窗口", 60, 240, 120, 30)
+        level_window = s3.slider("近期水平窗口", 7, 56, 28, 7)
+        trend_strength = s4.slider("趋势强度", 0.0, 1.0, 0.5, 0.1)
+        s5, s6, s7 = st.columns(3)
+        weekday_shrinkage = s5.slider("星期收缩", 0.0, 30.0, 8.0, 1.0)
+        month_shrinkage = s6.slider("月内位置收缩", 0.0, 40.0, 15.0, 1.0)
+        holiday_shrinkage = s7.slider("节假日收缩", 0.0, 30.0, 8.0, 1.0)
+        run_structural = st.form_submit_button("运行当前阶段评估", type="primary")
+    if run_structural:
+        try:
+            params = StructuralParams(
+                trend_window=int(trend_window), level_window=int(level_window),
+                trend_strength=float(trend_strength),
+                weekday_shrinkage=float(weekday_shrinkage),
+                month_shrinkage=float(month_shrinkage),
+                holiday_shrinkage=float(holiday_shrinkage),
+            )
+            with st.spinner("正在执行结构模型分阶段评估..."):
+                structural_valid, structural_submission = run_structural_session(
+                    structural_mode, params, structural_stage
+                )
+            st.session_state["structural_valid"] = structural_valid
+            if structural_submission is None:
+                st.session_state.pop("structural_submission", None)
+            else:
+                st.session_state["structural_submission"] = structural_submission
+            st.session_state["structural_meta"] = {
+                "stage": structural_stage, "mode": structural_mode, **params.__dict__
+            }
+            st.success("当前阶段评估完成；结果仅保存在当前会话。")
+        except Exception as exc:
+            st.error(f"结构模型运行失败：{exc}")
+    if "structural_valid" in st.session_state:
+        structural_score = evaluate_prediction(st.session_state["structural_valid"])
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("加权 MAPE", f"{structural_score['flow_mape']:.4f}")
+        sc2.metric("尾部 P90", f"{structural_score['tail_p90']:.4f}")
+        sc3.metric("严重错误比例", f"{structural_score['severe_30_ratio']:.1%}")
+        sc4.metric("风险调整损失", f"{structural_score['risk_adjusted_loss']:.4f}")
+        if "structural_submission" in st.session_state:
+            st.download_button(
+                "下载本次确认后的结构模型候选文件（无表头）",
+                st.session_state["structural_submission"].to_csv(index=False, header=False).encode("utf-8-sig"),
+                "tc_comp_predict_table_structural_tuned.csv",
+                mime="text/csv",
+            )
+
+    st.divider()
+    st.markdown("### 机器学习快速试验（辅助）")
     st.info("默认是快速交互训练，结果只保存到当前 Streamlit 会话。需要按正式递归逻辑评估并生成调参提交文件时，请手动打开下方“正式滚动评估”。")
     st.warning("两种模式都不会覆盖 output/、models/ 或默认正式提交文件；浏览器会话结束后，本次调参结果会消失，请及时下载。")
 
@@ -496,18 +646,18 @@ with tab2:
             st.error(f"训练失败：{exc}")
 
     st.divider()
-    st.markdown("### 正式滚动评估与提交文件生成")
+    st.markdown("### 机器学习独立8月确认与候选生成")
     formal_enabled = st.toggle(
-        "手动开启正式滚动评估",
+        "手动开启独立确认",
         value=False,
-        help="开启后才显示正式调参表单。提交表单会执行8月递归评估、全量重训和9月递归预测，耗时明显长于快速训练。",
+        help="只应填入开发折已经选定的参数；执行8月递归确认、全量重训和9月预测。",
     )
     if not formal_enabled:
         st.caption("当前未开启。默认快速训练仍只更新会话中的展示结果。")
     else:
         st.warning(
-            "正式模式会真实训练两轮模型：先评估2014年8月，再使用截至8月底的全部历史重训并预测9月。"
-            "结果仅保存在当前会话，不修改项目默认模型。"
+            "这里是冻结参数后的独立确认，不应反复根据8月结果调参。系统会先评估2014年8月，"
+            "再使用截至8月底的全部历史重训并预测9月；结果仅保存在当前会话。"
         )
         with st.form("formal_evaluation_form"):
             f1, f2, f3, f4 = st.columns(4)
@@ -562,7 +712,7 @@ with tab2:
                 help="剩余权重分配给最近12个同星期日均值。"
             )
             run_formal = st.form_submit_button(
-                "运行正式评估并生成调参提交文件", type="primary"
+                "运行独立确认并生成候选文件", type="primary"
             )
 
         if run_formal:
@@ -604,18 +754,18 @@ with tab2:
                     "model_params": formal_params,
                     **formal_metadata,
                 }
-                st.success("正式评估和9月预测已完成；结果仅保存在当前会话，请在下方下载。")
+                st.success("独立确认和9月预测已完成；结果仅保存在当前会话，请在下方下载。")
             except Exception as exc:
                 st.error(f"正式评估失败：{exc}")
 
     if "formal_valid" in st.session_state and "formal_submission" in st.session_state:
-        st.markdown("#### 本次正式调参结果")
+        st.markdown("#### 本次独立确认结果")
         formal_metrics = evaluate_prediction(st.session_state["formal_valid"])
         fm1, fm2, fm3, fm4 = st.columns(4)
-        fm1.metric("申购 MAPE", f"{formal_metrics['purchase_mape']:.4f}")
-        fm2.metric("赎回 MAPE", f"{formal_metrics['redeem_mape']:.4f}")
-        fm3.metric("模拟总分", f"{formal_metrics['total_score']:.4f}")
-        fm4.metric("入模特征", st.session_state["formal_meta"]["feature_count"])
+        fm1.metric("加权 MAPE", f"{formal_metrics['flow_mape']:.4f}")
+        fm2.metric("尾部 P90", f"{formal_metrics['tail_p90']:.4f}")
+        fm3.metric("严重错误比例", f"{formal_metrics['severe_30_ratio']:.1%}")
+        fm4.metric("风险调整损失", f"{formal_metrics['risk_adjusted_loss']:.4f}")
         with st.expander("查看本次参数、早停轮数和9月预测", expanded=False):
             st.json(st.session_state["formal_meta"])
             st.dataframe(st.session_state["formal_submission"], use_container_width=True)
@@ -635,10 +785,10 @@ with tab2:
     else:
         metrics = evaluate_prediction(display_valid)
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("申购 MAPE", f"{metrics['purchase_mape']:.4f}")
-        c2.metric("赎回 MAPE", f"{metrics['redeem_mape']:.4f}")
-        c3.metric("模拟总分", f"{metrics['total_score']:.4f}")
-        c4.metric("零分日", f"{int(display_valid['is_zero_score_day'].sum())} 天")
+        c1.metric("加权 MAPE", f"{metrics['flow_mape']:.4f}")
+        c2.metric("尾部 P90", f"{metrics['tail_p90']:.4f}")
+        c3.metric("严重错误比例", f"{metrics['severe_30_ratio']:.1%}")
+        c4.metric("风险调整损失", f"{metrics['risk_adjusted_loss']:.4f}")
 
         purchase_plot = display_valid[["date", "purchase_true", "purchase_pred"]].melt("date", var_name="类型", value_name="金额")
         redeem_plot = display_valid[["date", "redeem_true", "redeem_pred"]].melt("date", var_name="类型", value_name="金额")
@@ -659,7 +809,11 @@ with tab2:
 
 with tab3:
     st.subheader("预测结果展示模块")
-    pred = read_csv_if_exists(SUBMISSION_WITH_HEADER_PATH)
+    prediction_sources = {"正式 XGBoost 基线": SUBMISSION_WITH_HEADER_PATH}
+    if STRUCTURAL_SUBMISSION_WITH_HEADER_PATH.exists():
+        prediction_sources["结构模型候选（回测最佳模式）"] = STRUCTURAL_SUBMISSION_WITH_HEADER_PATH
+    prediction_name = st.selectbox("选择9月预测结果", list(prediction_sources))
+    pred = read_csv_if_exists(prediction_sources[prediction_name])
     if pred is None:
         st.warning("尚未生成预测结果文件，请先运行：python run_all.py")
     else:
@@ -667,9 +821,21 @@ with tab3:
         st.markdown("### 未来30天预测结果（2014年9月）")
         st.dataframe(pred[["report_date", "purchase", "redeem"]], use_container_width=True)
         pred_plot = pred[["date", "purchase", "redeem"]].melt("date", var_name="类型", value_name="金额")
-        st.plotly_chart(px.line(pred_plot, x="date", y="金额", color="类型", title="2014年9月申购/赎回预测"), use_container_width=True)
+        st.plotly_chart(px.line(pred_plot, x="date", y="金额", color="类型", title=f"2014年9月申购/赎回预测：{prediction_name}"), use_container_width=True)
         submit_bytes = pred[["report_date", "purchase", "redeem"]].to_csv(index=False, header=False).encode("utf-8-sig")
         st.download_button("下载天池提交文件（无表头）", submit_bytes, "tc_comp_predict_table.csv")
+
+    if "structural_submission" in st.session_state:
+        st.markdown("### 本次结构模型调参候选（仅当前会话）")
+        tuned_structural = st.session_state["structural_submission"]
+        st.dataframe(tuned_structural, use_container_width=True)
+        st.download_button(
+            "下载调参后的结构模型候选（无表头）",
+            tuned_structural.to_csv(index=False, header=False).encode("utf-8-sig"),
+            "tc_comp_predict_table_structural_tuned.csv",
+            mime="text/csv",
+            key="download_structural_submission_tab3",
+        )
 
     if "formal_submission" in st.session_state:
         st.markdown("### 本次正式调参提交文件（仅当前会话）")
@@ -699,6 +865,16 @@ with tab4:
     if display_valid is None:
         st.warning("暂无验证集结果，请先运行完整流程或在模型训练页训练模型。")
     else:
+        error_metrics = evaluate_prediction(display_valid)
+        em1, em2, em3, em4 = st.columns(4)
+        em1.metric("加权 MAPE", f"{error_metrics['flow_mape']:.4f}")
+        em2.metric("尾部 P90", f"{error_metrics['tail_p90']:.4f}")
+        em3.metric(">20% 加权比例", f"{error_metrics['severe_20_ratio']:.1%}")
+        em4.metric(">30% 加权比例", f"{error_metrics['severe_30_ratio']:.1%}")
+        st.caption(
+            f"申购 >30%：{error_metrics['purchase_over_30_days']}天；"
+            f"赎回 >30%：{error_metrics['redeem_over_30_days']}天。"
+        )
         show_cols = [
             "date", "异常类型",
             "purchase_true", "purchase_pred", "purchase_abs_error", "purchase_error", "purchase_score", "purchase_direction",
@@ -713,17 +889,33 @@ with tab4:
             use_container_width=True,
         )
 
-        st.markdown("### 零分日高亮（相对误差 > 30%）")
-        zero_days = display_valid[display_valid["is_zero_score_day"]].copy()
+        st.markdown("### 严重错误日（任一目标相对误差 > 30%）")
+        zero_days = display_valid[display_valid["is_severe_error_day"]].copy()
         if zero_days.empty:
-            st.success("当前展示结果没有误差超过30%的零分日。")
+            st.success("当前展示结果没有相对误差超过30%的严重错误日。")
         else:
             st.dataframe(zero_days[show_cols], use_container_width=True)
             zero_plot = zero_days[["date", "purchase_error", "redeem_error"]].melt("date", var_name="误差类型", value_name="相对误差")
-            st.plotly_chart(px.bar(zero_plot, x="date", y="相对误差", color="误差类型", barmode="group", title="零分日相对误差"), use_container_width=True)
+            st.plotly_chart(px.bar(zero_plot, x="date", y="相对误差", color="误差类型", barmode="group", title="严重错误日相对误差"), use_container_width=True)
+
+        st.markdown("### 周期维度误差定位")
+        cycle_error = display_valid.copy()
+        cycle_error["星期"] = cycle_error["date"].dt.day_name()
+        cycle_error["月内阶段"] = pd.cut(
+            cycle_error["date"].dt.day,
+            bins=[0, 3, 10, 20, 28, 31],
+            labels=["月初1-3", "上旬4-10", "中旬11-20", "下旬21-28", "月末29-31"],
+        )
+        ec1, ec2 = st.columns(2)
+        weekday_error = cycle_error.groupby("星期", as_index=False, observed=True)[["purchase_error", "redeem_error"]].mean()
+        weekday_error = weekday_error.melt("星期", var_name="资金流", value_name="平均相对误差")
+        ec1.plotly_chart(px.bar(weekday_error, x="星期", y="平均相对误差", color="资金流", barmode="group", title="按星期聚合"), use_container_width=True)
+        month_error = cycle_error.groupby("月内阶段", as_index=False, observed=True)[["purchase_error", "redeem_error"]].mean()
+        month_error = month_error.melt("月内阶段", var_name="资金流", value_name="平均相对误差")
+        ec2.plotly_chart(px.bar(month_error, x="月内阶段", y="平均相对误差", color="资金流", barmode="group", title="按月内阶段聚合"), use_container_width=True)
 
         st.markdown("### 改进方向提示")
         st.info(
-            "若零分日集中在月初/月末，说明需要更强的月内周期或后处理策略；"
+            "若严重错误日集中在月初/月末，说明需要更强的月内周期或后处理策略；"
             "若集中在周日，说明周末资金行为波动大；若是孤立高值，则可能需要外部业务信息辅助判断。"
         )
