@@ -19,6 +19,12 @@ from src.config import (
     DATA_DIR,
 )
 from src.evaluate import evaluate_prediction, mock_score_from_error, relative_error
+from src.train import get_feature_columns as get_formal_feature_columns
+from src.backtest import (
+    build_exogenous_values,
+    recursive_forecast,
+    train_refitted_ensemble,
+)
 
 st.set_page_config(page_title="资金流入流出预测系统", layout="wide")
 st.title("资金流入流出预测系统")
@@ -241,7 +247,94 @@ def train_interactive_model(model_name, n_estimators, max_depth, learning_rate, 
     return result, cv_df, loss_df, feature_cols
 
 
+def run_formal_evaluation(
+    model_name, model_params, n_seeds, random_state, smooth_weight,
+    purchase_model_weight, redeem_model_weight,
+):
+    """Run leakage-safe August evaluation and produce an in-memory September submission."""
+    df = read_csv_if_exists(DAILY_FEATURES_PATH)
+    if df is None:
+        raise FileNotFoundError("缺少 output/daily_features.csv，请先运行完整流程生成特征文件。")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    df = df[df["date"] >= pd.Timestamp("2013-08-01")].copy()
+    feature_cols = get_formal_feature_columns(df)
+
+    august = pd.Period("2014-08", freq="M")
+    history = df[df["date"] < august.start_time].copy()
+    actual = df[df["date"].dt.to_period("M") == august].copy()
+    if history.empty or actual.empty:
+        raise ValueError("特征数据必须覆盖 2013-08 至 2014-08，才能执行正式滚动评估。")
+
+    purchase_model, purchase_iterations = train_refitted_ensemble(
+        history, feature_cols, "purchase", n_seeds,
+        model_name=model_name, preset="default", model_params=model_params,
+        start_seed=random_state,
+    )
+    redeem_model, redeem_iterations = train_refitted_ensemble(
+        history, feature_cols, "redeem", n_seeds,
+        model_name=model_name, preset="default", model_params=model_params,
+        start_seed=random_state + 100,
+    )
+    validation_prediction = recursive_forecast(
+        purchase_model, redeem_model, history,
+        pd.date_range(august.start_time, august.end_time.normalize(), freq="D"),
+        feature_cols, build_exogenous_values(df, feature_cols, august),
+        apply_month_end_boost=False,
+        purchase_model_weight=purchase_model_weight,
+        redeem_model_weight=redeem_model_weight,
+        smooth_weight=smooth_weight,
+    )
+    validation = validation_prediction.merge(
+        actual[["date", "purchase", "redeem"]].rename(
+            columns={"purchase": "purchase_true", "redeem": "redeem_true"}
+        ),
+        on="date",
+        how="inner",
+    )
+    validation = enrich_prediction_result(validation)
+
+    # Refit with all data through August, then recursively forecast September.
+    final_purchase_model, final_purchase_iterations = train_refitted_ensemble(
+        df, feature_cols, "purchase", n_seeds,
+        model_name=model_name, preset="default", model_params=model_params,
+        start_seed=random_state,
+    )
+    final_redeem_model, final_redeem_iterations = train_refitted_ensemble(
+        df, feature_cols, "redeem", n_seeds,
+        model_name=model_name, preset="default", model_params=model_params,
+        start_seed=random_state + 100,
+    )
+    september = pd.Period("2014-09", freq="M")
+    september_prediction = recursive_forecast(
+        final_purchase_model, final_redeem_model, df,
+        pd.date_range(september.start_time, september.end_time.normalize(), freq="D"),
+        feature_cols, build_exogenous_values(df, feature_cols, september),
+        apply_month_end_boost=False,
+        purchase_model_weight=purchase_model_weight,
+        redeem_model_weight=redeem_model_weight,
+        smooth_weight=smooth_weight,
+    )
+    submission = september_prediction.rename(
+        columns={"purchase_pred": "purchase", "redeem_pred": "redeem"}
+    )
+    submission["report_date"] = submission["date"].dt.strftime("%Y%m%d").astype(int)
+    submission["purchase"] = submission["purchase"].round().clip(lower=0).astype("int64")
+    submission["redeem"] = submission["redeem"].round().clip(lower=0).astype("int64")
+    submission = submission[["report_date", "purchase", "redeem"]]
+    metadata = {
+        "feature_count": len(feature_cols),
+        "validation_purchase_iterations": purchase_iterations,
+        "validation_redeem_iterations": redeem_iterations,
+        "final_purchase_iterations": final_purchase_iterations,
+        "final_redeem_iterations": final_redeem_iterations,
+    }
+    return validation, submission, metadata
+
+
 def get_display_validation(source_name: str):
+    if source_name == "本次正式调参评估" and "formal_valid" in st.session_state:
+        return st.session_state["formal_valid"].copy()
     if source_name == "本次交互训练结果" and "interactive_valid" in st.session_state:
         return st.session_state["interactive_valid"].copy()
     valid = read_csv_if_exists(VALIDATION_PRED_PATH)
@@ -299,6 +392,8 @@ with st.sidebar:
     st.divider()
     st.header("展示结果来源")
     source_options = ["主流程滚动预测结果"]
+    if "formal_valid" in st.session_state:
+        source_options.append("本次正式调参评估")
     if "interactive_valid" in st.session_state:
         source_options.append("本次交互训练结果")
     result_source = st.radio("选择当前展示结果", source_options)
@@ -365,8 +460,8 @@ with tab1:
 with tab2:
     st.subheader("模型训练与评估模块")
     st.markdown("### 选择模型和参数进行真实训练")
-    st.info("本模块会在页面中真实训练申购模型和赎回模型，并把训练结果保存到当前 Streamlit 会话，用于后续预测对比和误差分析展示。")
-    st.warning("交互训练用于课堂演示和模型/参数对比，结果只保存在当前会话，不覆盖 output/、models/ 或正式提交文件；正式评估结果以主流程滚动预测为准。")
+    st.info("默认是快速交互训练，结果只保存到当前 Streamlit 会话。需要按正式递归逻辑评估并生成调参提交文件时，请手动打开下方“正式滚动评估”。")
+    st.warning("两种模式都不会覆盖 output/、models/ 或默认正式提交文件；浏览器会话结束后，本次调参结果会消失，请及时下载。")
 
     col1, col2, col3, col4 = st.columns(4)
     model_name = col1.selectbox("模型", ["XGBoost", "LightGBM", "RandomForest", "GradientBoosting"])
@@ -399,6 +494,140 @@ with tab2:
             st.success("训练完成，已更新当前会话中的交互训练结果。可在侧边栏切换展示来源。")
         except Exception as exc:
             st.error(f"训练失败：{exc}")
+
+    st.divider()
+    st.markdown("### 正式滚动评估与提交文件生成")
+    formal_enabled = st.toggle(
+        "手动开启正式滚动评估",
+        value=False,
+        help="开启后才显示正式调参表单。提交表单会执行8月递归评估、全量重训和9月递归预测，耗时明显长于快速训练。",
+    )
+    if not formal_enabled:
+        st.caption("当前未开启。默认快速训练仍只更新会话中的展示结果。")
+    else:
+        st.warning(
+            "正式模式会真实训练两轮模型：先评估2014年8月，再使用截至8月底的全部历史重训并预测9月。"
+            "结果仅保存在当前会话，不修改项目默认模型。"
+        )
+        with st.form("formal_evaluation_form"):
+            f1, f2, f3, f4 = st.columns(4)
+            formal_model_label = f1.selectbox("正式评估模型", ["XGBoost", "LightGBM"])
+            formal_n_estimators = f2.number_input(
+                "最大树数量", min_value=100, max_value=10000, value=2000, step=100
+            )
+            formal_max_depth = f3.number_input(
+                "最大深度", min_value=1, max_value=16, value=2, step=1
+            )
+            formal_learning_rate = f4.number_input(
+                "学习率", min_value=0.0005, max_value=0.2,
+                value=0.02, step=0.001, format="%.4f"
+            )
+
+            f5, f6, f7, f8 = st.columns(4)
+            formal_n_seeds = f5.number_input(
+                "集成随机种子数", min_value=1, max_value=5, value=3, step=1
+            )
+            formal_random_state = f6.number_input(
+                "起始随机种子", min_value=0, max_value=9999, value=42, step=1
+            )
+            formal_min_child = f7.number_input(
+                "最小子节点样本/权重", min_value=1, max_value=100, value=8, step=1
+            )
+            formal_num_leaves = f8.number_input(
+                "LightGBM叶子数", min_value=2, max_value=255, value=7, step=1,
+                disabled=formal_model_label != "LightGBM",
+            )
+
+            f9, f10, f11, f12 = st.columns(4)
+            formal_subsample = f9.slider("行采样比例", 0.5, 1.0, 0.85, 0.05)
+            formal_colsample = f10.slider("列采样比例", 0.5, 1.0, 0.85, 0.05)
+            formal_reg_alpha = f11.number_input(
+                "L1正则", min_value=0.0, max_value=20.0, value=0.1, step=0.1
+            )
+            formal_reg_lambda = f12.number_input(
+                "L2正则", min_value=0.0, max_value=20.0, value=2.0, step=0.1
+            )
+
+            f13, f14, f15 = st.columns(3)
+            formal_smooth_weight = f13.slider(
+                "模型预测平滑权重", 0.80, 1.00, 0.99, 0.01,
+                help="剩余权重分配给最近7日均值。"
+            )
+            formal_purchase_weight = f14.slider(
+                "申购模型权重", 0.0, 1.0, 1.0, 0.05,
+                help="剩余权重分配给最近12个同星期日均值。"
+            )
+            formal_redeem_weight = f15.slider(
+                "赎回模型权重", 0.0, 1.0, 0.5, 0.05,
+                help="剩余权重分配给最近12个同星期日均值。"
+            )
+            run_formal = st.form_submit_button(
+                "运行正式评估并生成调参提交文件", type="primary"
+            )
+
+        if run_formal:
+            formal_model_name = formal_model_label.lower()
+            formal_params = {
+                "n_estimators": int(formal_n_estimators),
+                "learning_rate": float(formal_learning_rate),
+                "max_depth": int(formal_max_depth),
+                "subsample": float(formal_subsample),
+                "colsample_bytree": float(formal_colsample),
+                "reg_alpha": float(formal_reg_alpha),
+                "reg_lambda": float(formal_reg_lambda),
+            }
+            if formal_model_name == "xgboost":
+                formal_params["min_child_weight"] = int(formal_min_child)
+            else:
+                formal_params["min_child_samples"] = int(formal_min_child)
+                formal_params["num_leaves"] = int(formal_num_leaves)
+            try:
+                with st.spinner("正在执行正式递归评估、全量重训和9月预测，请稍候..."):
+                    formal_valid, formal_submission, formal_metadata = run_formal_evaluation(
+                        formal_model_name,
+                        formal_params,
+                        int(formal_n_seeds),
+                        int(formal_random_state),
+                        float(formal_smooth_weight),
+                        float(formal_purchase_weight),
+                        float(formal_redeem_weight),
+                    )
+                st.session_state["formal_valid"] = formal_valid
+                st.session_state["formal_submission"] = formal_submission
+                st.session_state["formal_meta"] = {
+                    "model": formal_model_label,
+                    "n_seeds": int(formal_n_seeds),
+                    "random_state": int(formal_random_state),
+                    "smooth_weight": float(formal_smooth_weight),
+                    "purchase_model_weight": float(formal_purchase_weight),
+                    "redeem_model_weight": float(formal_redeem_weight),
+                    "model_params": formal_params,
+                    **formal_metadata,
+                }
+                st.success("正式评估和9月预测已完成；结果仅保存在当前会话，请在下方下载。")
+            except Exception as exc:
+                st.error(f"正式评估失败：{exc}")
+
+    if "formal_valid" in st.session_state and "formal_submission" in st.session_state:
+        st.markdown("#### 本次正式调参结果")
+        formal_metrics = evaluate_prediction(st.session_state["formal_valid"])
+        fm1, fm2, fm3, fm4 = st.columns(4)
+        fm1.metric("申购 MAPE", f"{formal_metrics['purchase_mape']:.4f}")
+        fm2.metric("赎回 MAPE", f"{formal_metrics['redeem_mape']:.4f}")
+        fm3.metric("模拟总分", f"{formal_metrics['total_score']:.4f}")
+        fm4.metric("入模特征", st.session_state["formal_meta"]["feature_count"])
+        with st.expander("查看本次参数、早停轮数和9月预测", expanded=False):
+            st.json(st.session_state["formal_meta"])
+            st.dataframe(st.session_state["formal_submission"], use_container_width=True)
+        tuned_submit_bytes = st.session_state["formal_submission"].to_csv(
+            index=False, header=False
+        ).encode("utf-8-sig")
+        st.download_button(
+            "下载本次调参后的天池提交文件（无表头）",
+            tuned_submit_bytes,
+            "tc_comp_predict_table_tuned.csv",
+            mime="text/csv",
+        )
 
     display_valid = get_display_validation(result_source)
     if display_valid is None:
@@ -441,6 +670,19 @@ with tab3:
         st.plotly_chart(px.line(pred_plot, x="date", y="金额", color="类型", title="2014年9月申购/赎回预测"), use_container_width=True)
         submit_bytes = pred[["report_date", "purchase", "redeem"]].to_csv(index=False, header=False).encode("utf-8-sig")
         st.download_button("下载天池提交文件（无表头）", submit_bytes, "tc_comp_predict_table.csv")
+
+    if "formal_submission" in st.session_state:
+        st.markdown("### 本次正式调参提交文件（仅当前会话）")
+        tuned_pred = st.session_state["formal_submission"]
+        st.dataframe(tuned_pred, use_container_width=True)
+        tuned_submit_bytes = tuned_pred.to_csv(index=False, header=False).encode("utf-8-sig")
+        st.download_button(
+            "下载调参后的提交文件（无表头）",
+            tuned_submit_bytes,
+            "tc_comp_predict_table_tuned.csv",
+            mime="text/csv",
+            key="download_tuned_submission_tab3",
+        )
 
     display_valid = get_display_validation(result_source)
     if display_valid is not None:

@@ -145,7 +145,8 @@ def make_training_target(frame, target, target_mode):
 
 def train_refitted_ensemble(
     history, feature_cols, target, n_seeds, target_mode="direct",
-    model_name="lightgbm", preset="default"
+    model_name="lightgbm", preset="default", model_params=None,
+    start_seed=42,
 ):
     """Tune on the last historical month, then refit on all fold history."""
     last_period = history["date"].dt.to_period("M").max()
@@ -162,14 +163,14 @@ def train_refitted_ensemble(
     y_full = make_training_target(history, target, target_mode)
 
     if model_name == "ridge":
-        model = build_ridge()
+        model = build_ridge(**(model_params or {}))
         model.fit(X_full, y_full)
         return MeanModel([model]), [0]
 
     models = []
-    overrides = model_overrides(model_name, preset)
+    overrides = {**model_overrides(model_name, preset), **(model_params or {})}
     best_iterations = []
-    for seed in range(42, 42 + n_seeds):
+    for seed in range(start_seed, start_seed + n_seeds):
         if model_name == "xgboost":
             tuned = build_xgboost(seed=seed, **overrides)
             tuned.fit(X_fit, y_fit, eval_set=[(X_tune, y_tune)], verbose=False)
