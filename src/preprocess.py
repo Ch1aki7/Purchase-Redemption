@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from .config import DAILY_FEATURES_PATH
+from .config import DAILY_FEATURES_PATH, DATA_QUALITY_REPORT_PATH
 from .data_loader import load_all_tables, normalize_columns
 
 
@@ -8,6 +8,53 @@ def parse_date(series):
     return pd.to_datetime(series.astype(str), format="%Y%m%d", errors="coerce")
 
 
+def check_balance_consistency(user_balance: pd.DataFrame) -> pd.DataFrame:
+    """校验余额一致性：tBalance = yBalance + total_purchase_amt - total_redeem_amt。
+
+    该校验用于满足课程指导书的数据一致性要求，只输出数据质量统计，
+    不会删除或修改训练样本，避免改变原始赛题数据分布。
+    """
+    required_cols = ["tBalance", "yBalance", "total_purchase_amt", "total_redeem_amt"]
+    missing_cols = [col for col in required_cols if col not in user_balance.columns]
+    if missing_cols:
+        return pd.DataFrame([
+            {
+                "check_item": "balance_consistency",
+                "status": "skipped",
+                "message": f"缺少字段：{', '.join(missing_cols)}",
+                "total_records": len(user_balance),
+                "consistent_records": np.nan,
+                "inconsistent_records": np.nan,
+                "inconsistent_ratio": np.nan,
+                "max_abs_error": np.nan,
+                "mean_abs_error": np.nan,
+            }
+        ])
+
+    balance = user_balance[required_cols].apply(pd.to_numeric, errors="coerce")
+    expected = balance["yBalance"] + balance["total_purchase_amt"] - balance["total_redeem_amt"]
+    diff = balance["tBalance"] - expected
+    valid_mask = balance.notna().all(axis=1)
+    valid_diff = diff[valid_mask]
+    consistent_mask = valid_diff.abs() <= 1e-6
+    inconsistent_records = int((~consistent_mask).sum())
+    total_valid_records = int(valid_mask.sum())
+    inconsistent_ratio = inconsistent_records / total_valid_records if total_valid_records else np.nan
+
+    return pd.DataFrame([
+        {
+            "check_item": "balance_consistency",
+            "status": "passed" if inconsistent_records == 0 else "warning",
+            "message": "校验 tBalance = yBalance + total_purchase_amt - total_redeem_amt",
+            "total_records": int(len(user_balance)),
+            "valid_records": total_valid_records,
+            "consistent_records": int(consistent_mask.sum()),
+            "inconsistent_records": inconsistent_records,
+            "inconsistent_ratio": inconsistent_ratio,
+            "max_abs_error": float(valid_diff.abs().max()) if total_valid_records else np.nan,
+            "mean_abs_error": float(valid_diff.abs().mean()) if total_valid_records else np.nan,
+        }
+    ])
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["dayofweek"] = df["date"].dt.dayofweek
@@ -143,6 +190,14 @@ def main():
     for col in required_balance_cols:
         if col not in user_balance.columns:
             raise ValueError(f"user_balance_table 缺少必要字段：{col}")
+
+    quality_report = check_balance_consistency(user_balance)
+    DATA_QUALITY_REPORT_PATH.parent.mkdir(exist_ok=True)
+    quality_report.to_csv(DATA_QUALITY_REPORT_PATH, index=False, encoding="utf-8-sig")
+    print(f"数据质量报告已生成：{DATA_QUALITY_REPORT_PATH}")
+    if "inconsistent_records" in quality_report.columns:
+        inconsistent_records = quality_report.loc[0, "inconsistent_records"]
+        print(f"余额一致性异常记录数：{inconsistent_records}")
 
     # 1. 聚合每日申购/赎回总额
     user_balance["date"] = parse_date(user_balance["report_date"])

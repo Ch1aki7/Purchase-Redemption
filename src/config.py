@@ -9,7 +9,10 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
 DAILY_FEATURES_PATH = OUTPUT_DIR / "daily_features.csv"
+DATA_QUALITY_REPORT_PATH = OUTPUT_DIR / "data_quality_report.csv"
 VALIDATION_PRED_PATH = OUTPUT_DIR / "validation_prediction.csv"
+BACKTEST_PRED_PATH = OUTPUT_DIR / "rolling_backtest_predictions.csv"
+BACKTEST_METRICS_PATH = OUTPUT_DIR / "rolling_backtest_metrics.csv"
 SUBMISSION_PATH = OUTPUT_DIR / "tc_comp_predict_table.csv"
 SUBMISSION_WITH_HEADER_PATH = OUTPUT_DIR / "tc_comp_predict_table_with_header.csv"
 FEATURE_COLUMNS_PATH = MODEL_DIR / "feature_columns.json"

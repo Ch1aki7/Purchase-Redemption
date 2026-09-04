@@ -2,499 +2,465 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.model_selection import TimeSeriesSplit
 
 from src.config import (
     DAILY_FEATURES_PATH,
-    ROOT_DIR,
-    SUBMISSION_WITH_HEADER_PATH,
+    DATA_QUALITY_REPORT_PATH,
     VALIDATION_PRED_PATH,
+    SUBMISSION_WITH_HEADER_PATH,
+    ROOT_DIR,
+    DATA_DIR,
 )
-from src.data_loader import load_all_tables, normalize_columns
-from src.evaluate import build_daily_error_frame, evaluate_prediction
-from src.train import train_and_evaluate
+from src.evaluate import evaluate_prediction, mock_score_from_error, relative_error
 
 st.set_page_config(page_title="资金流入流出预测系统", layout="wide")
 st.title("资金流入流出预测系统")
-st.caption("数据探索 · 模型训练与评估 · 预测结果 · 误差分析")
-
-SEX_MAP = {0: "女", 1: "男"}
+st.caption("数据探索、模型训练与评估、预测结果展示、误差分析")
 
 
-@st.cache_data(show_spinner=False)
-def read_csv_if_exists(path_str: str):
-    path = Path(path_str)
+# =========================
+# 通用工具函数
+# =========================
+
+def read_csv_if_exists(path: Path):
     if path.exists():
         return pd.read_csv(path)
     return None
 
 
-@st.cache_data(show_spinner=False)
-def load_user_profile():
-    """返回 (dataframe, error_message)。成功时 error_message 为空字符串。"""
-    try:
-        user_profile, _, _, _ = load_all_tables()
-        return normalize_columns(user_profile), ""
-    except Exception as exc:
-        return None, str(exc)
-
-
-def history_to_frame(history, target_name: str) -> pd.DataFrame | None:
-    if not history:
+def find_data_file(keyword: str):
+    if not DATA_DIR.exists():
         return None
-    # LightGBM: {'train': {'l2': [...]}, 'valid': {'l2': [...]}}
-    frames = []
-    for split_name, metrics in history.items():
-        metric_name = "l2" if "l2" in metrics else next(iter(metrics))
-        frames.append(pd.DataFrame({
-            "iteration": list(range(1, len(metrics[metric_name]) + 1)),
-            "loss": metrics[metric_name],
-            "split": split_name,
-            "target": target_name,
-        }))
-    return pd.concat(frames, ignore_index=True) if frames else None
+    candidates = list(DATA_DIR.glob("*.csv")) + list(DATA_DIR.glob("*.txt"))
+    for p in candidates:
+        if keyword.lower() in p.name.lower():
+            return p
+    return None
 
 
-def highlight_high_error(row, purchase_thr, redeem_thr):
-    styles = [""] * len(row)
-    cols = list(row.index)
-    if "purchase_rel_error" in cols and row["purchase_rel_error"] >= purchase_thr:
-        styles[cols.index("purchase_rel_error")] = "background-color: #ffc7ce; font-weight: 600"
-        if "purchase_abs_error" in cols:
-            styles[cols.index("purchase_abs_error")] = "background-color: #ffc7ce"
-    if "redeem_rel_error" in cols and row["redeem_rel_error"] >= redeem_thr:
-        styles[cols.index("redeem_rel_error")] = "background-color: #ffc7ce; font-weight: 600"
-        if "redeem_abs_error" in cols:
-            styles[cols.index("redeem_abs_error")] = "background-color: #ffc7ce"
-    if "daily_score" in cols and row["daily_score"] <= 5:
-        styles[cols.index("daily_score")] = "background-color: #ffeb9c; font-weight: 600"
-    return styles
+def read_raw_table(keyword: str):
+    path = find_data_file(keyword)
+    if path is None:
+        return None
+    for enc in ["utf-8", "utf-8-sig", "gbk", "gb18030"]:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception:
+            continue
+    return None
 
 
+def get_feature_columns(df: pd.DataFrame):
+    exclude = {"date", "purchase", "redeem"}
+    return [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+
+
+def classify_anomaly(date):
+    date = pd.Timestamp(date)
+    if date.day == 1:
+        return "月初异常"
+    if date.day >= date.days_in_month - 2:
+        return "月末异常"
+    if date.dayofweek == 6:
+        return "周日波动"
+    if date.strftime("%m-%d") == "08-08":
+        return "孤立高值"
+    if date.day >= date.days_in_month - 4:
+        return "月末附近"
+    return "普通日期"
+
+
+def enrich_prediction_result(valid: pd.DataFrame) -> pd.DataFrame:
+    valid = valid.copy()
+    valid["date"] = pd.to_datetime(valid["date"])
+    valid["purchase_abs_error"] = (valid["purchase_pred"] - valid["purchase_true"]).abs()
+    valid["redeem_abs_error"] = (valid["redeem_pred"] - valid["redeem_true"]).abs()
+    valid["purchase_error"] = relative_error(valid["purchase_true"], valid["purchase_pred"])
+    valid["redeem_error"] = relative_error(valid["redeem_true"], valid["redeem_pred"])
+    valid["purchase_score"] = mock_score_from_error(valid["purchase_error"])
+    valid["redeem_score"] = mock_score_from_error(valid["redeem_error"])
+    valid["daily_weighted_score"] = valid["purchase_score"] * 0.45 + valid["redeem_score"] * 0.55
+    valid["purchase_direction"] = np.where(valid["purchase_pred"] > valid["purchase_true"], "高估", "低估")
+    valid["redeem_direction"] = np.where(valid["redeem_pred"] > valid["redeem_true"], "高估", "低估")
+    valid["is_zero_score_day"] = (valid["purchase_error"] > 0.3) | (valid["redeem_error"] > 0.3)
+    valid["异常类型"] = valid["date"].apply(classify_anomaly)
+    return valid
+
+
+def build_model(model_name: str, n_estimators: int, max_depth: int, learning_rate: float, random_state: int):
+    if model_name == "RandomForest":
+        depth = None if max_depth == 0 else max_depth
+        return RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=depth,
+            min_samples_leaf=3,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+    if model_name == "GradientBoosting":
+        depth = 3 if max_depth == 0 else max_depth
+        return GradientBoostingRegressor(
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=depth,
+            random_state=random_state,
+        )
+    if model_name == "LightGBM":
+        try:
+            from lightgbm import LGBMRegressor
+        except Exception as exc:
+            raise RuntimeError("当前环境未安装 LightGBM，请选择 RandomForest 或 GradientBoosting。") from exc
+        depth = -1 if max_depth == 0 else max_depth
+        return LGBMRegressor(
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=depth,
+            num_leaves=31,
+            min_child_samples=5,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=-1,
+        )
+    raise ValueError(f"未知模型：{model_name}")
+
+
+def run_cv(model_name, X, y, n_estimators, max_depth, learning_rate, random_state):
+    rows = []
+    tscv = TimeSeriesSplit(n_splits=3)
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
+        model = build_model(model_name, n_estimators, max_depth, learning_rate, random_state + fold)
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        pred = np.expm1(model.predict(X.iloc[val_idx]))
+        true = np.expm1(y.iloc[val_idx])
+        rows.append({"折数": fold, "MAPE": mean_absolute_percentage_error(true, pred)})
+    return pd.DataFrame(rows)
+
+
+def build_loss_curve(model_name, X_train, y_train, X_valid, y_valid, n_estimators, max_depth, learning_rate, random_state):
+    points = sorted(set([max(5, int(n_estimators * r)) for r in [0.2, 0.4, 0.6, 0.8, 1.0]]))
+    rows = []
+    for n in points:
+        model = build_model(model_name, n, max_depth, learning_rate, random_state)
+        model.fit(X_train, y_train)
+        train_pred = np.expm1(model.predict(X_train))
+        valid_pred = np.expm1(model.predict(X_valid))
+        train_true = np.expm1(y_train)
+        valid_true = np.expm1(y_valid)
+        rows.append({
+            "训练轮数/树数": n,
+            "训练MAPE": mean_absolute_percentage_error(train_true, train_pred),
+            "验证MAPE": mean_absolute_percentage_error(valid_true, valid_pred),
+        })
+    return pd.DataFrame(rows)
+
+
+def train_interactive_model(model_name, n_estimators, max_depth, learning_rate, random_state, use_log_target=True):
+    df = read_csv_if_exists(DAILY_FEATURES_PATH)
+    if df is None:
+        raise FileNotFoundError("缺少 output/daily_features.csv，请先运行完整流程生成特征文件。")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    df = df[df["date"] >= pd.Timestamp("2013-08-01")].copy()
+    train_df = df[df["date"] <= pd.Timestamp("2014-07-31")].copy()
+    valid_df = df[(df["date"] >= pd.Timestamp("2014-08-01")) & (df["date"] <= pd.Timestamp("2014-08-31"))].copy()
+    feature_cols = get_feature_columns(df)
+    X_train = train_df[feature_cols].fillna(0)
+    X_valid = valid_df[feature_cols].fillna(0)
+
+    if use_log_target:
+        y_purchase_train = np.log1p(train_df["purchase"])
+        y_redeem_train = np.log1p(train_df["redeem"])
+    else:
+        y_purchase_train = train_df["purchase"].astype(float)
+        y_redeem_train = train_df["redeem"].astype(float)
+
+    p_model = build_model(model_name, n_estimators, max_depth, learning_rate, random_state)
+    r_model = build_model(model_name, n_estimators, max_depth, learning_rate, random_state + 100)
+    p_model.fit(X_train, y_purchase_train)
+    r_model.fit(X_train, y_redeem_train)
+
+    if use_log_target:
+        purchase_pred = np.expm1(p_model.predict(X_valid))
+        redeem_pred = np.expm1(r_model.predict(X_valid))
+    else:
+        purchase_pred = p_model.predict(X_valid)
+        redeem_pred = r_model.predict(X_valid)
+
+    purchase_pred = np.maximum(0, purchase_pred)
+    redeem_pred = np.maximum(0, redeem_pred)
+    result = pd.DataFrame({
+        "date": valid_df["date"].values,
+        "purchase_true": valid_df["purchase"].values,
+        "purchase_pred": purchase_pred,
+        "redeem_true": valid_df["redeem"].values,
+        "redeem_pred": redeem_pred,
+    })
+    result = enrich_prediction_result(result)
+
+    cv_purchase = run_cv(model_name, X_train, y_purchase_train, n_estimators, max_depth, learning_rate, random_state)
+    cv_redeem = run_cv(model_name, X_train, y_redeem_train, n_estimators, max_depth, learning_rate, random_state + 100)
+    cv_df = cv_purchase.rename(columns={"MAPE": "申购MAPE"}).merge(
+        cv_redeem.rename(columns={"MAPE": "赎回MAPE"}), on="折数"
+    )
+    cv_df["加权MAPE"] = cv_df["申购MAPE"] * 0.45 + cv_df["赎回MAPE"] * 0.55
+
+    loss_purchase = build_loss_curve(model_name, X_train, y_purchase_train, X_valid, np.log1p(valid_df["purchase"]), n_estimators, max_depth, learning_rate, random_state)
+    loss_purchase["目标"] = "申购"
+    loss_redeem = build_loss_curve(model_name, X_train, y_redeem_train, X_valid, np.log1p(valid_df["redeem"]), n_estimators, max_depth, learning_rate, random_state + 100)
+    loss_redeem["目标"] = "赎回"
+    loss_df = pd.concat([loss_purchase, loss_redeem], ignore_index=True)
+
+    return result, cv_df, loss_df, feature_cols
+
+
+def get_display_validation(source_name: str):
+    if source_name == "本次交互训练结果" and "interactive_valid" in st.session_state:
+        return st.session_state["interactive_valid"].copy()
+    valid = read_csv_if_exists(VALIDATION_PRED_PATH)
+    if valid is None:
+        return None
+    return enrich_prediction_result(valid)
+
+
+# =========================
+# 侧边栏：运行与结果选择
+# =========================
 with st.sidebar:
-    st.header("操作")
-    st.write("项目根目录：", str(ROOT_DIR))
-    if st.button("一键运行完整流程（预处理+训练+预测）"):
-        with st.spinner("正在运行，请稍候..."):
+    st.divider()
+    st.header("运行控制")
+    st.warning("一键运行完整流程会重新生成 output/ 下的特征、验证和预测文件，并覆盖 models/ 下的正式模型文件。")
+    with st.expander("完整流程固定参数说明", expanded=False):
+        st.markdown(
+            """
+            **一键运行完整流程使用 `src/train.py` 和 `src/predict.py` 中的固定正式配置，\
+            不会读取下方交互训练区域的页面参数。**
+
+            - 训练数据：`2013-08-01` 至 `2014-07-31`
+            - 本地验证：`2014-08-01` 至 `2014-08-31`，采用逐日滚动预测
+            - 最终预测：`2014-09-01` 至 `2014-09-30`，逐日滚动预测并回填预测值
+            - 主模型：多种子 `LightGBM` 集成，申购和赎回分别训练
+            - 集成设置：`n_seeds=3`，随机种子为 `42、43、44`
+            - LightGBM 参数：`n_estimators=10000`，`learning_rate=0.001`，`num_leaves=31`，`max_depth=-1`
+            - 正则与采样：`min_child_samples=5`，`subsample=0.85`，`colsample_bytree=0.85`，`reg_alpha=0.05`，`reg_lambda=0.05`
+            - 目标变换：训练时使用 `log1p`，预测后使用 `expm1` 还原金额
+            - 平滑修正：`预测值 × 0.99 + 近7日均值 × 0.01`
+            - 月末后处理：月末最后3天申购 `×1.2`，赎回 `×1.3`
+            - 外部变量：8月验证使用7月均值，9月预测使用8月均值
+            - 输出文件：`output/daily_features.csv`、`output/data_quality_report.csv`、`output/validation_prediction.csv`、`output/tc_comp_predict_table.csv`、`models/*.pkl`
+            """
+        )
+    if st.button("一键运行完整流程", type="secondary"):
+        with st.spinner("正在执行 run_all.py，可能需要几分钟..."):
             result = subprocess.run(
                 [sys.executable, "run_all.py"],
                 cwd=ROOT_DIR,
-                text=True,
                 capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-        st.code((result.stdout or "") + "\n" + (result.stderr or ""))
         if result.returncode == 0:
-            st.success("运行完成，请刷新页面查看最新结果")
-            st.cache_data.clear()
+            st.success("完整流程运行完成，已刷新正式结果文件。")
         else:
-            st.error("运行失败，请查看上方日志")
+            st.error("完整流程运行失败，请查看输出信息。")
+        with st.expander("运行输出"):
+            st.code((result.stdout or "") + "\n" + (result.stderr or ""))
+
+    st.divider()
+    st.header("展示结果来源")
+    source_options = ["主流程滚动预测结果"]
+    if "interactive_valid" in st.session_state:
+        source_options.append("本次交互训练结果")
+    result_source = st.radio("选择当前展示结果", source_options)
 
 
-tab1, tab2, tab3, tab4 = st.tabs(["数据探索", "模型训练与评估", "预测结果", "误差分析"])
+# =========================
+# 页面主体
+# =========================
+tab1, tab2, tab3, tab4 = st.tabs(["数据探索", "模型训练与评估", "预测结果展示", "误差分析"])
 
-# ---------------------------------------------------------------------------
-# 1. 数据探索
-# ---------------------------------------------------------------------------
 with tab1:
-    st.subheader("历史申购 / 赎回趋势")
-    df = read_csv_if_exists(str(DAILY_FEATURES_PATH))
+    st.subheader("数据探索模块")
+    df = read_csv_if_exists(DAILY_FEATURES_PATH)
     if df is None:
-        st.warning("尚未生成 daily_features.csv，请先在侧边栏运行完整流程，或执行：python run_all.py")
+        st.warning("尚未生成 daily_features.csv，请先运行：python run_all.py")
     else:
-        df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("日级样本数", len(df))
+        c2.metric("特征列数", len(df.columns))
+        c3.metric("日期范围", f"{df['date'].min().date()} ~ {df['date'].max().date()}")
+        st.dataframe(df.head(20), use_container_width=True)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("样本天数", f"{len(df)}")
-        c2.metric("日均申购", f"{df['purchase'].mean():,.0f}")
-        c3.metric("日均赎回", f"{df['redeem'].mean():,.0f}")
-        c4.metric("活跃用户峰值", f"{int(df['user_count'].max()):,}" if "user_count" in df.columns else "-")
+        quality_report = read_csv_if_exists(DATA_QUALITY_REPORT_PATH)
+        if quality_report is not None:
+            st.markdown("### 数据质量校验")
+            st.caption("余额一致性校验：tBalance = yBalance + total_purchase_amt - total_redeem_amt")
+            st.dataframe(quality_report, use_container_width=True)
 
-        plot_df = df[["date", "purchase", "redeem"]].melt(id_vars="date", var_name="类型", value_name="金额")
-        st.plotly_chart(
-            px.line(plot_df, x="date", y="金额", color="类型", title="每日申购/赎回总额趋势"),
-            use_container_width=True,
-        )
+        fund_plot = df[["date", "purchase", "redeem"]].melt(id_vars="date", var_name="类型", value_name="金额")
+        st.plotly_chart(px.line(fund_plot, x="date", y="金额", color="类型", title="历史申购/赎回趋势图"), use_container_width=True)
 
-        if "user_count" in df.columns:
-            st.plotly_chart(
-                px.line(df, x="date", y="user_count", title="每日活跃用户数变化"),
-                use_container_width=True,
-            )
-
-        st.subheader("收益率变化")
         yield_cols = [c for c in ["mfd_daily_yield", "mfd_7daily_yield"] if c in df.columns]
         if yield_cols:
-            yield_plot = df[["date"] + yield_cols].melt("date", var_name="指标", value_name="数值")
-            st.plotly_chart(
-                px.line(yield_plot, x="date", y="数值", color="指标", title="余额宝收益率走势"),
-                use_container_width=True,
-            )
-        else:
-            st.info("特征表中暂无收益率字段。")
+            yield_plot = df[["date"] + yield_cols].melt("date", var_name="收益率字段", value_name="数值")
+            st.plotly_chart(px.line(yield_plot, x="date", y="数值", color="收益率字段", title="收益率变化图"), use_container_width=True)
 
-        st.subheader("银行间拆借利率（Shibor）")
         shibor_cols = [c for c in df.columns if c.startswith("Interest_")]
         if shibor_cols:
-            selected = st.multiselect(
-                "选择利率期限",
-                shibor_cols,
-                default=[c for c in ["Interest_O_N", "Interest_1_W", "Interest_1_M"] if c in shibor_cols],
-            )
-            if selected:
-                shibor_plot = df[["date"] + selected].melt("date", var_name="期限", value_name="利率(%)")
-                st.plotly_chart(
-                    px.line(shibor_plot, x="date", y="利率(%)", color="期限", title="Shibor 利率变化"),
-                    use_container_width=True,
-                )
-        else:
-            st.info("特征表中暂无 Shibor 字段。")
+            chosen_shibor = st.multiselect("选择要展示的 Shibor 指标", shibor_cols, default=shibor_cols[: min(3, len(shibor_cols))])
+            if chosen_shibor:
+                shibor_plot = df[["date"] + chosen_shibor].melt("date", var_name="Shibor字段", value_name="利率")
+                st.plotly_chart(px.line(shibor_plot, x="date", y="利率", color="Shibor字段", title="Shibor 利率变化图"), use_container_width=True)
 
-        st.subheader("用户分布")
-        profile, profile_error = load_user_profile()
-        if profile_error:
-            st.warning(f"用户画像加载失败：{profile_error}")
-        elif profile is None:
-            st.warning("未找到用户信息表。")
-        else:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if "sex" in profile.columns:
-                    sex_df = profile["sex"].map(SEX_MAP).fillna("未知").value_counts().reset_index()
-                    sex_df.columns = ["性别", "用户数"]
-                    st.plotly_chart(
-                        px.pie(sex_df, names="性别", values="用户数", title="用户性别分布"),
-                        use_container_width=True,
-                    )
-            with col_b:
-                if "constellation" in profile.columns:
-                    star_df = profile["constellation"].fillna("未知").value_counts().reset_index()
-                    star_df.columns = ["星座", "用户数"]
-                    st.plotly_chart(
-                        px.bar(star_df, x="星座", y="用户数", title="用户星座分布"),
-                        use_container_width=True,
-                    )
-            if "city" in profile.columns:
-                city_df = profile["city"].value_counts().head(15).reset_index()
-                city_df.columns = ["城市编码", "用户数"]
-                st.plotly_chart(
-                    px.bar(city_df, x="城市编码", y="用户数", title="用户城市 Top15（脱敏编码）"),
-                    use_container_width=True,
-                )
+    profile = read_raw_table("user_profile")
+    if profile is None:
+        st.info("未找到用户画像原始表，用户分布图需要解压原始数据后展示。")
+    else:
+        st.markdown("### 用户分布")
+        col1, col2, col3 = st.columns(3)
+        if "sex" in profile.columns:
+            sex_counts = profile["sex"].fillna("未知").astype(str).value_counts().reset_index()
+            sex_counts.columns = ["性别", "人数"]
+            col1.plotly_chart(px.pie(sex_counts, names="性别", values="人数", title="性别分布"), use_container_width=True)
+        if "city" in profile.columns:
+            city_counts = profile["city"].fillna("未知").astype(str).value_counts().head(10).reset_index()
+            city_counts.columns = ["城市", "人数"]
+            col2.plotly_chart(px.bar(city_counts, x="城市", y="人数", title="城市Top10"), use_container_width=True)
+        if "constellation" in profile.columns:
+            cons_counts = profile["constellation"].fillna("未知").astype(str).value_counts().reset_index()
+            cons_counts.columns = ["星座", "人数"]
+            col3.plotly_chart(px.bar(cons_counts, x="星座", y="人数", title="星座分布"), use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# 2. 模型训练与评估
-# ---------------------------------------------------------------------------
 with tab2:
-    st.subheader("选择模型与参数后训练")
-    st.markdown(
-        "评分说明：相对误差越小得分越高；**总分 = 申购得分 × 0.45 + 赎回得分 × 0.55**"
-        "（赎回权重更高，建议优先优化赎回误差）。"
-    )
+    st.subheader("模型训练与评估模块")
+    st.markdown("### 选择模型和参数进行真实训练")
+    st.info("本模块会在页面中真实训练申购模型和赎回模型，并把训练结果保存到当前 Streamlit 会话，用于后续预测对比和误差分析展示。")
+    st.warning("交互训练用于课堂演示和模型/参数对比，结果只保存在当前会话，不覆盖 output/、models/ 或正式提交文件；正式评估结果以主流程滚动预测为准。")
 
-    left, right = st.columns([1, 1])
-    with left:
-        model_type = st.selectbox("模型", ["LightGBM", "RandomForest"], index=0)
-        n_estimators = st.slider("树的数量 n_estimators", 50, 800, 400, 50)
-        max_depth = st.slider("最大深度 max_depth（-1 表示不限制，仅 LightGBM）", -1, 20, -1, 1)
-    with right:
-        learning_rate = st.slider("学习率 learning_rate（仅 LightGBM）", 0.01, 0.2, 0.03, 0.01)
-        num_leaves = st.slider("叶子数 num_leaves（仅 LightGBM）", 8, 128, 31, 1)
-        n_splits = st.slider("时序交叉验证折数", 2, 5, 3, 1)
-        save_model = st.checkbox("训练后覆盖保存模型与验证结果", value=True)
+    col1, col2, col3, col4 = st.columns(4)
+    model_name = col1.selectbox("模型", ["RandomForest", "GradientBoosting", "LightGBM"])
+    n_estimators = col2.slider("树数量/训练轮数", min_value=20, max_value=500, value=100, step=20)
+    max_depth = col3.slider("最大深度（0表示不限制/默认）", min_value=0, max_value=20, value=6, step=1)
+    learning_rate = col4.select_slider("学习率", options=[0.001, 0.003, 0.005, 0.01, 0.03, 0.05, 0.1], value=0.03)
+    random_state = st.number_input("随机种子", min_value=0, max_value=9999, value=42, step=1)
 
-    if st.button("开始训练并评估", type="primary"):
-        params = {
-            "model_type": "lightgbm" if model_type == "LightGBM" else "randomforest",
-            "n_estimators": n_estimators,
-            "learning_rate": learning_rate,
-            "max_depth": max_depth,
-            "num_leaves": num_leaves,
-        }
-        with st.spinner("训练中，请稍候..."):
-            try:
-                train_result = train_and_evaluate(
-                    model_params=params,
-                    save=save_model,
-                    run_cv=True,
-                    n_splits=n_splits,
+    if st.button("训练并更新展示结果", type="primary"):
+        try:
+            with st.spinner("正在训练模型、生成损失曲线和交叉验证结果..."):
+                result, cv_df, loss_df, feature_cols = train_interactive_model(
+                    model_name,
+                    int(n_estimators),
+                    int(max_depth),
+                    float(learning_rate),
+                    int(random_state),
+                    use_log_target=True,
                 )
-                st.session_state["train_result"] = train_result
-                st.cache_data.clear()
-                st.success("训练完成")
-            except Exception as exc:
-                st.error(f"训练失败：{exc}")
+            st.session_state["interactive_valid"] = result
+            st.session_state["interactive_cv"] = cv_df
+            st.session_state["interactive_loss"] = loss_df
+            st.session_state["interactive_meta"] = {
+                "model": model_name,
+                "n_estimators": n_estimators,
+                "max_depth": max_depth,
+                "learning_rate": learning_rate,
+                "feature_count": len(feature_cols),
+            }
+            st.success("训练完成，已更新当前会话中的交互训练结果。可在侧边栏切换展示来源。")
+        except Exception as exc:
+            st.error(f"训练失败：{exc}")
 
-    train_result = st.session_state.get("train_result")
-    valid = read_csv_if_exists(str(VALIDATION_PRED_PATH))
-    if train_result is not None:
-        metrics = train_result["metrics"]
-        source_label = "本次交互训练结果"
-        valid_view = train_result["valid_result"].copy()
-    elif valid is not None:
-        valid_view = valid.copy()
-        metrics = evaluate_prediction(valid_view)
-        source_label = "已保存的验证集结果（可在上方重新训练）"
+    display_valid = get_display_validation(result_source)
+    if display_valid is None:
+        st.warning("暂无验证集结果，请先运行完整流程或在本页训练模型。")
     else:
-        valid_view = None
-        metrics = None
-        source_label = None
+        metrics = evaluate_prediction(display_valid)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("申购 MAPE", f"{metrics['purchase_mape']:.4f}")
+        c2.metric("赎回 MAPE", f"{metrics['redeem_mape']:.4f}")
+        c3.metric("模拟总分", f"{metrics['total_score']:.4f}")
+        c4.metric("零分日", f"{int(display_valid['is_zero_score_day'].sum())} 天")
 
-    if metrics is None:
-        st.warning("尚无验证结果。请先训练，或运行 python run_all.py")
-    else:
-        st.caption(source_label)
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("申购 MAPE", f"{metrics['purchase_mape']:.4f}")
-        m2.metric("赎回 MAPE", f"{metrics['redeem_mape']:.4f}")
-        m3.metric("申购得分", f"{metrics['purchase_score']:.3f}")
-        m4.metric("赎回得分", f"{metrics['redeem_score']:.3f}")
-        m5.metric("模拟总分", f"{metrics['total_score']:.3f}")
+        purchase_plot = display_valid[["date", "purchase_true", "purchase_pred"]].melt("date", var_name="类型", value_name="金额")
+        redeem_plot = display_valid[["date", "redeem_true", "redeem_pred"]].melt("date", var_name="类型", value_name="金额")
+        st.plotly_chart(px.line(purchase_plot, x="date", y="金额", color="类型", title=f"申购：真实值 vs 预测值（{result_source}）"), use_container_width=True)
+        st.plotly_chart(px.line(redeem_plot, x="date", y="金额", color="类型", title=f"赎回：真实值 vs 预测值（{result_source}）"), use_container_width=True)
 
-        valid_view["date"] = pd.to_datetime(valid_view["date"])
-        purchase_plot = valid_view[["date", "purchase_true", "purchase_pred"]].melt(
-            "date", var_name="类型", value_name="金额"
-        )
-        redeem_plot = valid_view[["date", "redeem_true", "redeem_pred"]].melt(
-            "date", var_name="类型", value_name="金额"
-        )
-        st.plotly_chart(
-            px.line(purchase_plot, x="date", y="金额", color="类型", title="申购：真实值 vs 预测值（8月验证集）"),
-            use_container_width=True,
-        )
-        st.plotly_chart(
-            px.line(redeem_plot, x="date", y="金额", color="类型", title="赎回：真实值 vs 预测值（8月验证集）"),
-            use_container_width=True,
-        )
+    if "interactive_loss" in st.session_state:
+        st.markdown("### 训练过程损失曲线")
+        loss_df = st.session_state["interactive_loss"]
+        loss_plot = loss_df.melt(["训练轮数/树数", "目标"], value_vars=["训练MAPE", "验证MAPE"], var_name="曲线", value_name="MAPE")
+        st.plotly_chart(px.line(loss_plot, x="训练轮数/树数", y="MAPE", color="曲线", line_dash="目标", markers=True, title="训练过程损失曲线"), use_container_width=True)
 
-        st.subheader("训练损失曲线")
-        if train_result is None:
-            st.info("点击上方「开始训练并评估」后，可展示 LightGBM 的 train/valid 损失曲线。RandomForest 无线程损失记录。")
-        else:
-            loss_frames = []
-            for hist, name in [
-                (train_result.get("purchase_history"), "purchase"),
-                (train_result.get("redeem_history"), "redeem"),
-            ]:
-                frame = history_to_frame(hist, name)
-                if frame is not None:
-                    loss_frames.append(frame)
-            if not loss_frames:
-                st.info("当前模型未提供迭代损失（例如 RandomForest）。可改用 LightGBM 查看损失曲线。")
-            else:
-                loss_df = pd.concat(loss_frames, ignore_index=True)
-                st.plotly_chart(
-                    px.line(
-                        loss_df,
-                        x="iteration",
-                        y="loss",
-                        color="split",
-                        facet_col="target",
-                        title="训练过程损失曲线（log1p 目标上的 L2）",
-                    ),
-                    use_container_width=True,
-                )
+    if "interactive_cv" in st.session_state:
+        st.markdown("### 时间序列交叉验证结果")
+        st.dataframe(st.session_state["interactive_cv"], use_container_width=True)
+        cv_plot = st.session_state["interactive_cv"].melt("折数", value_vars=["申购MAPE", "赎回MAPE", "加权MAPE"], var_name="指标", value_name="MAPE")
+        st.plotly_chart(px.bar(cv_plot, x="折数", y="MAPE", color="指标", barmode="group", title="交叉验证 MAPE"), use_container_width=True)
 
-        st.subheader("时序交叉验证结果")
-        if train_result is not None and train_result.get("cv_results") is not None:
-            cv_df = train_result["cv_results"]
-            st.dataframe(cv_df, use_container_width=True)
-            st.plotly_chart(
-                px.bar(
-                    cv_df.melt(id_vars="fold", value_vars=["purchase_mape", "redeem_mape", "total_score"],
-                               var_name="指标", value_name="数值"),
-                    x="fold",
-                    y="数值",
-                    color="指标",
-                    barmode="group",
-                    title="各折交叉验证指标",
-                ),
-                use_container_width=True,
-            )
-            st.caption(
-                f"CV 平均总分：{cv_df['total_score'].mean():.3f}；"
-                f"赎回 MAPE 均值：{cv_df['redeem_mape'].mean():.4f}"
-            )
-        else:
-            st.info("重新训练后将展示时序交叉验证各折结果。")
-
-# ---------------------------------------------------------------------------
-# 3. 预测结果
-# ---------------------------------------------------------------------------
 with tab3:
-    st.subheader("2014年9月预测结果（提交文件）")
-    pred = read_csv_if_exists(str(SUBMISSION_WITH_HEADER_PATH))
+    st.subheader("预测结果展示模块")
+    pred = read_csv_if_exists(SUBMISSION_WITH_HEADER_PATH)
     if pred is None:
-        st.warning("尚未生成预测结果文件，请先运行完整流程。")
+        st.warning("尚未生成预测结果文件，请先运行：python run_all.py")
     else:
-        pred = pred.copy()
         pred["date"] = pd.to_datetime(pred["report_date"].astype(str))
+        st.markdown("### 未来30天预测结果（2014年9月）")
         st.dataframe(pred[["report_date", "purchase", "redeem"]], use_container_width=True)
         pred_plot = pred[["date", "purchase", "redeem"]].melt("date", var_name="类型", value_name="金额")
-        st.plotly_chart(
-            px.line(pred_plot, x="date", y="金额", color="类型", title="2014年9月申购/赎回预测"),
-            use_container_width=True,
-        )
+        st.plotly_chart(px.line(pred_plot, x="date", y="金额", color="类型", title="2014年9月申购/赎回预测"), use_container_width=True)
         submit_bytes = pred[["report_date", "purchase", "redeem"]].to_csv(index=False, header=False).encode("utf-8-sig")
         st.download_button("下载天池提交文件（无表头）", submit_bytes, "tc_comp_predict_table.csv")
 
-    st.subheader("验证集对比与每日积分（有真实值）")
-    st.caption("9 月无公开真实值；以下用 2014 年 8 月验证集展示预测 vs 真实、每日误差与总分。")
-    valid = read_csv_if_exists(str(VALIDATION_PRED_PATH))
-    if valid is None:
-        st.warning("缺少 validation_prediction.csv")
-    else:
-        err_df = build_daily_error_frame(valid)
-        metrics = evaluate_prediction(err_df)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("验证集总分", f"{metrics['total_score']:.3f}")
-        c2.metric("申购 MAPE", f"{metrics['purchase_mape']:.4f}")
-        c3.metric("赎回 MAPE", f"{metrics['redeem_mape']:.4f}")
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=err_df["date"], y=err_df["purchase_true"], name="申购真实"))
-        fig.add_trace(go.Scatter(x=err_df["date"], y=err_df["purchase_pred"], name="申购预测"))
-        fig.add_trace(go.Scatter(x=err_df["date"], y=err_df["redeem_true"], name="赎回真实"))
-        fig.add_trace(go.Scatter(x=err_df["date"], y=err_df["redeem_pred"], name="赎回预测"))
-        fig.update_layout(title="8月验证集：真实值与预测值", xaxis_title="日期", yaxis_title="金额")
-        st.plotly_chart(fig, use_container_width=True)
-
-        score_plot = err_df[["date", "purchase_score", "redeem_score", "daily_score"]].melt(
-            "date", var_name="得分项", value_name="得分"
-        )
-        st.plotly_chart(
-            px.line(score_plot, x="date", y="得分", color="得分项", title="验证集每日模拟得分"),
-            use_container_width=True,
-        )
-        show = err_df[[
-            "date", "purchase_true", "purchase_pred", "purchase_abs_error", "purchase_rel_error",
-            "redeem_true", "redeem_pred", "redeem_abs_error", "redeem_rel_error", "daily_score",
-        ]].copy()
-        show["purchase_rel_error"] = (show["purchase_rel_error"] * 100).round(2)
-        show["redeem_rel_error"] = (show["redeem_rel_error"] * 100).round(2)
-        show = show.rename(columns={
-            "purchase_rel_error": "申购相对误差%",
-            "redeem_rel_error": "赎回相对误差%",
-            "purchase_abs_error": "申购绝对误差",
-            "redeem_abs_error": "赎回绝对误差",
-            "daily_score": "当日得分",
-        })
-        st.dataframe(show, use_container_width=True)
-
-# ---------------------------------------------------------------------------
-# 4. 误差分析
-# ---------------------------------------------------------------------------
-with tab4:
-    st.subheader("验证集每日误差与得分")
-    valid = read_csv_if_exists(str(VALIDATION_PRED_PATH))
-    if valid is None:
-        st.warning("尚未生成 validation_prediction.csv，请先训练或运行完整流程。")
-    else:
-        err_df = build_daily_error_frame(valid)
-        purchase_thr = float(err_df["purchase_rel_error"].quantile(0.8))
-        redeem_thr = float(err_df["redeem_rel_error"].quantile(0.8))
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("申购平均绝对误差", f"{err_df['purchase_abs_error'].mean():,.0f}")
-        k2.metric("赎回平均绝对误差", f"{err_df['redeem_abs_error'].mean():,.0f}")
-        k3.metric("申购平均相对误差", f"{err_df['purchase_rel_error'].mean():.2%}")
-        k4.metric("赎回平均相对误差", f"{err_df['redeem_rel_error'].mean():.2%}")
-
-        abs_plot = err_df.melt(
-            id_vars="date",
-            value_vars=["purchase_abs_error", "redeem_abs_error"],
-            var_name="类型",
-            value_name="绝对误差",
-        )
-        abs_plot["类型"] = abs_plot["类型"].map({
-            "purchase_abs_error": "申购",
-            "redeem_abs_error": "赎回",
-        })
-        st.plotly_chart(
-            px.bar(abs_plot, x="date", y="绝对误差", color="类型", barmode="group", title="每日绝对误差"),
-            use_container_width=True,
-        )
-
-        rel_plot = err_df.melt(
-            id_vars="date",
-            value_vars=["purchase_rel_error", "redeem_rel_error"],
-            var_name="类型",
-            value_name="相对误差",
-        )
-        rel_plot["类型"] = rel_plot["类型"].map({
-            "purchase_rel_error": "申购",
-            "redeem_rel_error": "赎回",
-        })
-        fig_rel = px.line(rel_plot, x="date", y="相对误差", color="类型", title="每日相对误差")
-        fig_rel.add_hline(y=purchase_thr, line_dash="dot", annotation_text="申购高误差阈值(80%)")
-        st.plotly_chart(fig_rel, use_container_width=True)
-
-        st.plotly_chart(
-            px.bar(err_df, x="date", y="daily_score", title="每日模拟得分（越低越需要关注）",
-                   color="daily_score", color_continuous_scale="RdYlGn"),
-            use_container_width=True,
-        )
-
-        table = err_df[[
-            "date",
-            "purchase_abs_error", "purchase_rel_error", "purchase_score",
-            "redeem_abs_error", "redeem_rel_error", "redeem_score",
-            "daily_score",
-        ]].copy()
-        st.dataframe(
-            table.style.apply(
-                lambda r: highlight_high_error(r, purchase_thr, redeem_thr),
-                axis=1,
-            ).format({
-                "purchase_abs_error": "{:,.0f}",
-                "redeem_abs_error": "{:,.0f}",
-                "purchase_rel_error": "{:.2%}",
-                "redeem_rel_error": "{:.2%}",
-                "purchase_score": "{:.2f}",
-                "redeem_score": "{:.2f}",
-                "daily_score": "{:.2f}",
-            }),
-            use_container_width=True,
-        )
-        st.caption("红色高亮：相对误差位于验证集最高 20%；黄色高亮：当日得分 ≤ 5。")
-
-        st.subheader("高误差日期与改进方向")
-        worst = err_df.nsmallest(5, "daily_score")[
-            ["date", "purchase_rel_error", "redeem_rel_error", "daily_score"]
-        ].copy()
-        worst["weekday"] = worst["date"].dt.day_name()
-        st.dataframe(
-            worst.assign(
-                purchase_rel_error=lambda x: (x["purchase_rel_error"] * 100).round(2),
-                redeem_rel_error=lambda x: (x["redeem_rel_error"] * 100).round(2),
-            ).rename(columns={
-                "purchase_rel_error": "申购相对误差%",
-                "redeem_rel_error": "赎回相对误差%",
-                "daily_score": "当日得分",
-                "weekday": "星期",
-            }),
-            use_container_width=True,
-        )
-
-        redeem_worse = (err_df["redeem_rel_error"] > err_df["purchase_rel_error"]).mean()
-        weekend_gap = (
-            err_df.assign(is_weekend=lambda x: x["date"].dt.dayofweek >= 5)
-            .groupby("is_weekend")["daily_score"]
-            .mean()
-        )
-        tips = [
-            f"约 {redeem_worse:.0%} 的日期赎回相对误差高于申购；赎回权重 55%，建议优先加强赎回滞后/滚动特征或单独加大赎回模型复杂度。",
-            "高误差日多集中在周末或月初月末时，可增加节假日、发薪日、是否月初/月末交互特征。",
-            "若损失曲线出现明显过拟合（train 持续下降而 valid 回升），可降低 num_leaves / n_estimators，或提高学习率稳定性。",
-            "可在「模型训练与评估」页对比 LightGBM 与 RandomForest，并观察交叉验证中赎回 MAPE 是否同步下降。",
+    display_valid = get_display_validation(result_source)
+    if display_valid is not None:
+        st.markdown("### 验证集真实值对比与每日误差/得分")
+        show_cols = [
+            "date", "purchase_true", "purchase_pred", "purchase_abs_error", "purchase_error", "purchase_score",
+            "redeem_true", "redeem_pred", "redeem_abs_error", "redeem_error", "redeem_score", "daily_weighted_score",
         ]
-        if len(weekend_gap) == 2:
-            tips.insert(
-                1,
-                f"周末平均得分 {weekend_gap.get(True, float('nan')):.2f}，工作日平均得分 {weekend_gap.get(False, float('nan')):.2f}。",
-            )
-        for tip in tips:
-            st.markdown(f"- {tip}")
+        st.dataframe(display_valid[show_cols], use_container_width=True)
+
+with tab4:
+    st.subheader("误差分析模块")
+    display_valid = get_display_validation(result_source)
+    if display_valid is None:
+        st.warning("暂无验证集结果，请先运行完整流程或在模型训练页训练模型。")
+    else:
+        show_cols = [
+            "date", "异常类型",
+            "purchase_true", "purchase_pred", "purchase_abs_error", "purchase_error", "purchase_score", "purchase_direction",
+            "redeem_true", "redeem_pred", "redeem_abs_error", "redeem_error", "redeem_score", "redeem_direction",
+            "daily_weighted_score",
+        ]
+        st.markdown("### 每日误差、得分与高估/低估方向")
+        st.dataframe(
+            display_valid[show_cols].style.background_gradient(
+                subset=["purchase_error", "redeem_error", "purchase_abs_error", "redeem_abs_error"], cmap="Reds"
+            ),
+            use_container_width=True,
+        )
+
+        st.markdown("### 零分日高亮（相对误差 > 30%）")
+        zero_days = display_valid[display_valid["is_zero_score_day"]].copy()
+        if zero_days.empty:
+            st.success("当前展示结果没有误差超过30%的零分日。")
+        else:
+            st.dataframe(zero_days[show_cols], use_container_width=True)
+            zero_plot = zero_days[["date", "purchase_error", "redeem_error"]].melt("date", var_name="误差类型", value_name="相对误差")
+            st.plotly_chart(px.bar(zero_plot, x="date", y="相对误差", color="误差类型", barmode="group", title="零分日相对误差"), use_container_width=True)
+
+        st.markdown("### 改进方向提示")
+        st.info(
+            "若零分日集中在月初/月末，说明需要更强的月内周期或后处理策略；"
+            "若集中在周日，说明周末资金行为波动大；若是孤立高值，则可能需要外部业务信息辅助判断。"
+        )

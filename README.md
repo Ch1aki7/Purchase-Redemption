@@ -9,6 +9,7 @@
 本项目包含：
 
 - 数据读取与预处理
+- 用户余额一致性校验，并输出数据质量报告
 - 每日申购/赎回聚合
 - 多维特征工程：周期傅里叶编码、月初月末连续特征、节假日特征、滞后/滚动统计、历史同期、比率差分（全部基于历史值，无数据泄露）
 - LightGBM 建模，滚动预测评估（验证集与9月预测逻辑一致）
@@ -34,25 +35,27 @@ Purchase-Redemption/
 │   ├── config.py                             # 路径配置（统一管理所有输入输出路径）
 │   ├── data_loader.py                        # 数据读取（加载4张原始表并做基本清洗）
 │   ├── preprocess.py                         # 预处理与特征工程（构造113个特征）
-│   ├── train.py                              # 模型训练与验证（LightGBM+RF集成）
+│   ├── train.py                              # 模型训练与验证（多种子 LightGBM 集成）
 │   ├── predict.py                            # 9月滚动预测与提交文件生成
 │   └── evaluate.py                           # 评估函数（MAPE与模拟评分计算）
 │
 ├── output/                                   # 运行结果输出目录（运行后生成）
 │   ├── daily_features.csv                    # 预处理后的日级训练数据（含全部特征）
+│   ├── data_quality_report.csv               # 数据质量报告（余额一致性校验）
 │   ├── validation_prediction.csv             # 8月验证集预测结果（含真实值/预测值/误差）
 │   ├── tc_comp_predict_table.csv             # 9月最终预测提交文件（无表头，赛题格式）
 │   └── tc_comp_predict_table_with_header.csv # 9月预测带表头版本（便于查看）
 │
 ├── models/                                   # 训练好的模型文件目录（运行后生成）
-│   ├── model_purchase.pkl                    # 申购预测模型（LightGBM+RF集成）
-│   ├── model_redeem.pkl                      # 赎回预测模型（LightGBM+RF集成）
+│   ├── model_purchase.pkl                    # 申购预测模型（多种子 LightGBM 集成）
+│   ├── model_redeem.pkl                      # 赎回预测模型（多种子 LightGBM 集成）
 │   └── feature_columns.json                  # 特征列名清单（预测时保持特征一致）
 │
 ├── app.py                                    # Streamlit 可视化系统主入口
 ├── run_all.py                                # 一键运行完整流程（预处理→训练→预测）
 ├── requirements.txt                          # Python 依赖清单
 ├── Purchase Redemption Data.zip              # 原始数据压缩包（备份，不提交 Git）
+├── 设计报告.md                                # 面向课程指导书要求的项目设计报告
 ├── 项目二_需求分析与最小方案.md                # 课程需求分析与方案设计文档
 ├── LICENSE                                   # 开源许可证（MIT）
 └── .gitignore                                # Git 忽略规则
@@ -67,7 +70,7 @@ Purchase-Redemption/
 | `config.py` | 集中管理所有文件路径，避免硬编码 | `DAILY_FEATURES_PATH`、`MODEL_PURCHASE_PATH` 等 |
 | `data_loader.py` | 读取4张原始 CSV，解析日期，返回 DataFrame | `load_user_balance()`、`load_share_interest()` 等 |
 | `preprocess.py` | 聚合每日总量，构造113个特征并保存到 `output/daily_features.csv` | `add_month_start_end_features()`、`add_holiday_features()` 等 |
-| `train.py` | 训练 LightGBM+RandomForest 集成模型，用8月做验证集评估 | `EnsembleModel` 类、`build_lightgbm()` |
+| `train.py` | 训练多种子 LightGBM 集成模型，用8月做验证集评估 | `EnsembleModel` 类、`build_lightgbm()` |
 | `predict.py` | 对9月30天做滚动预测，生成赛题提交格式文件 | `rolling_predict()` |
 | `evaluate.py` | 计算 MAPE 和模拟评分，供训练和可视化共用 | `evaluate_prediction()` |
 
@@ -76,6 +79,7 @@ Purchase-Redemption/
 | 文件 | 作用 | 生成阶段 |
 |---|---|---|
 | `daily_features.csv` | 预处理后的日级宽表，每行一天，包含 purchase/redeem 和113个特征 | `preprocess.py` 运行后 |
+| `data_quality_report.csv` | 数据质量报告，统计余额一致性校验结果 | `preprocess.py` 运行后 |
 | `validation_prediction.csv` | 8月验证集预测对比，含 date、purchase_true/pred、redeem_true/pred | `train.py` 运行后 |
 | `tc_comp_predict_table.csv` | 9月预测提交文件，无表头，格式为 `report_date,purchase,redeem`，共30行 | `predict.py` 运行后 |
 | `tc_comp_predict_table_with_header.csv` | 带表头版本，便于人工查看和可视化展示 | `predict.py` 运行后 |
@@ -84,7 +88,7 @@ Purchase-Redemption/
 
 | 文件 | 作用 |
 |---|---|
-| `model_purchase.pkl` | 申购预测模型，`joblib` 序列化的 `EnsembleModel` 对象 |
+| `model_purchase.pkl` | 申购预测模型，`joblib` 序列化的多种子 LightGBM 集成对象 |
 | `model_redeem.pkl` | 赎回预测模型，同上 |
 | `feature_columns.json` | 训练时的特征列名顺序，预测时必须保持一致 |
 
@@ -129,6 +133,7 @@ output/tc_comp_predict_table.csv   赛题提交文件（30天预测）
 **阶段1：预处理与特征工程（`src/preprocess.py`）**
 
 - 从 `user_balance_table.csv` 按 `report_date` 聚合，得到每日 `purchase` 和 `redeem` 总量
+- 校验 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`，输出 `output/data_quality_report.csv`
 - 合并收益率表和 Shibor 利率表
 - 构造 113 个特征：周期傅里叶编码、月初月末连续特征、节假日、滞后/滚动统计、历史同期、比率差分
 - 输出 `output/daily_features.csv`
@@ -136,7 +141,7 @@ output/tc_comp_predict_table.csv   赛题提交文件（30天预测）
 **阶段2：模型训练（`src/train.py`）**
 
 - 读取 `daily_features.csv`，按日期切分：训练集 2013.08~2014.07，验证集 2014.08
-- 对 `purchase` 和 `redeem` 分别训练 `EnsembleModel`（3个不同随机种子的 LightGBM 平均）
+- 对 `purchase` 和 `redeem` 分别训练 `EnsembleModel`（3个不同随机种子的 LightGBM 平均，RandomForest 保留为降级接口但最终未启用）
 - 训练时目标做 `log1p` 变换（日总量上亿分，取对数稳定方差）
 - LightGBM 用验证集做 100 轮早停，自动找最优迭代轮数
 - **验证集评估采用滚动预测**：逐天预测8月1日→8月31日，预测值回填为下一天 lag 特征，与 9 月预测逻辑完全一致，避免使用8月真实历史导致分数虚高
@@ -147,7 +152,8 @@ output/tc_comp_predict_table.csv   赛题提交文件（30天预测）
 - 用 `joblib.load` 加载模型，读取 `feature_columns.json` 对齐特征顺序
 - 逐天滚动预测：第 1 天用 8 月最后一天的特征预测，预测值回填为第 2 天的 lag 特征
 - 9 月的收益率和 Shibor（未来未知）用 8 月均值填充
-- 平滑修正：模型预测 × 0.85 + 近 7 日均值 × 0.15，缓解滚动漂移
+- 平滑修正：模型预测 × 0.99 + 近 7 日均值 × 0.01，缓解滚动漂移
+- 月末3天上调：申购×1.2、赎回×1.3，缓解月末系统性低估
 - 输出 `output/tc_comp_predict_table.csv`（无表头，赛题格式）和带表头版本
 
 ### 3.3 models 目录文件说明
@@ -183,6 +189,10 @@ mfd_bank_shibor.csv
 
 如果缺少 `user_balance_table.csv`，模型无法训练。
 
+**用户画像说明**：项目已读取 `user_profile_table`，但最终预测目标是每日申购/赎回总量，且测试期未来用户画像难以稳定映射到每日资金流；因此当前主模型未直接使用用户画像特征，而是在数据资产说明和可视化展示中保留其作用边界。
+
+**余额一致性说明**：指导书要求关注 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`。项目已在 `src/preprocess.py` 中实现该校验，并输出 `output/data_quality_report.csv`。该报告只用于数据质量说明，不删除样本、不改变训练和预测逻辑。
+
 ## 四、安装依赖
 
 建议使用 Python 3.8 或以上版本。
@@ -205,6 +215,7 @@ python run_all.py
 
 ```text
 output/daily_features.csv
+output/data_quality_report.csv
 output/validation_prediction.csv
 output/tc_comp_predict_table.csv
 output/tc_comp_predict_table_with_header.csv
@@ -218,6 +229,7 @@ models/feature_columns.json
 | 文件 | 作用 |
 |---|---|
 | `daily_features.csv` | 预处理和特征工程后的日级训练数据 |
+| `data_quality_report.csv` | 数据质量报告，记录余额一致性校验统计 |
 | `validation_prediction.csv` | 2014 年 8 月验证集预测结果，用于评估模型效果 |
 | `tc_comp_predict_table.csv` | 2014 年 9 月最终预测提交文件，默认无表头 |
 | `tc_comp_predict_table_with_header.csv` | 带表头版本，便于查看和展示 |
@@ -230,10 +242,12 @@ streamlit run app.py
 
 页面包括：
 
-1. 数据探索：展示历史申购/赎回趋势
-2. 模型评估：展示 8 月验证集真实值与预测值对比
-3. 预测结果：展示 2014 年 9 月预测结果，并下载无表头提交文件
-4. 误差分析：展示验证集每日相对误差
+1. 数据探索：展示历史申购/赎回趋势、用户分布、收益率变化、Shibor 利率变化和数据质量报告
+2. 模型训练与评估：允许选择 RandomForest、GradientBoosting、LightGBM 及参数进行真实训练，并展示损失曲线、交叉验证和验证集对比
+3. 预测结果展示：展示 2014 年 9 月预测结果，并下载无表头提交文件，同时展示验证集每日误差和得分
+4. 误差分析：展示验证集绝对误差、相对误差、每日得分、零分日、高估/低估方向和改进提示
+
+侧边栏提供“一键运行完整流程”按钮，会执行 `run_all.py` 并重新生成 `output/` 与 `models/`；网页中的交互训练结果只保存在当前 Streamlit 会话中，不覆盖正式结果文件。
 
 如果首次运行 Streamlit 出现邮箱提示，直接按回车跳过即可。
 
@@ -296,3 +310,47 @@ streamlit run app.py
 ```
 
 项目已集成端到端流程：数据预处理 → 特征工程 → 多种子 LightGBM 集成训练 → 滚动预测（月末上调修正）→ 可视化展示。验证集采用与 9 月一致的滚动预测逻辑，线性近似公式模拟总分约 5.43 分（满分 10）。
+
+## 十、滚动回测
+
+为避免只在 2014 年 8 月上调参导致结论偏乐观，可以对多个历史月份执行扩展窗口回测。每个回测折只使用目标月份之前的数据；目标月内逐日递归预测，并把预测值回填为后续日期的滞后特征。
+
+快速回测默认使用 1 个 LightGBM 随机种子，评估 2014 年 4 月至 8 月：
+
+```bash
+python -m src.backtest
+```
+
+如需使用与正式模型相同的 3 种子集成：
+
+```bash
+python -m src.backtest --n-seeds 3
+```
+
+也可以指定月份：
+
+```bash
+python -m src.backtest --months 2014-06 2014-07 2014-08
+```
+
+回测会同时比较基础策略和当前月末上调策略，输出：
+
+```text
+output/rolling_backtest_predictions.csv
+output/rolling_backtest_metrics.csv
+```
+
+早停月份取自目标月之前；确定迭代轮数后，模型会使用目标月之前的全部历史重新拟合，避免用待评估月份选择树数量。
+
+### 快速回测结果（单种子）
+
+| 月份 | 基础策略 | 月末上调策略 |
+|---|---:|---:|
+| 2014-04 | 3.5235 | 3.1759 |
+| 2014-05 | 3.7577 | 3.7586 |
+| 2014-06 | 3.8617 | 3.8704 |
+| 2014-07 | 4.2028 | 4.0122 |
+| 2014-08 | 4.1732 | 4.4591 |
+| **五个月整体** | **3.9065** | **3.8596** |
+
+结果表明，月末申购乘 1.2、赎回乘 1.3 的规则虽然改善了 8 月表现，但在 4 月和 7 月明显降分，五个月整体也低于不做月末上调的基础策略。因此该规则存在对单一验证月过拟合的风险，不应仅凭 8 月结果认定为稳定优化。以上结果为快速单种子回测；正式比较可使用 `--n-seeds 3` 复核。
