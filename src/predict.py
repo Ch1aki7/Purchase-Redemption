@@ -12,6 +12,49 @@ from .config import (
 )
 
 
+# 由 2014-04～2014-07 选择参数，2014-08 留作独立检验。
+SEASONAL_BLEND_PARAMS = {
+    "purchase": {
+        "weeks": 16, "decay": 1.0, "trend_strength": 1.0,
+        "model_weight": 0.3, "scale": 0.90,
+    },
+    "redeem": {
+        "weeks": 12, "decay": 1.0, "trend_strength": 0.0,
+        "model_weight": 0.2, "scale": 0.95,
+    },
+}
+
+
+def weekday_seasonal_forecast(history, forecast_dates, target, params=None):
+    """基于预测起点前的真实历史，直接生成多步同星期预测，避免递归漂移。"""
+    params = params or SEASONAL_BLEND_PARAMS[target]
+    series = history.set_index("date")[target].astype(float).sort_index()
+    recent_level = float(series.tail(28).mean())
+    prior_level = float(series.iloc[-56:-28].mean())
+    level_ratio = (
+        float(np.clip(recent_level / prior_level, 0.85, 1.15))
+        if prior_level > 0 else 1.0
+    )
+
+    predictions = []
+    for horizon, date in enumerate(pd.DatetimeIndex(forecast_dates), start=1):
+        values = series[series.index.dayofweek == date.dayofweek].tail(params["weeks"]).to_numpy()
+        weights = params["decay"] ** np.arange(len(values) - 1, -1, -1)
+        weekday_level = float(np.average(values, weights=weights))
+        trend = level_ratio ** (params["trend_strength"] * horizon / 28.0)
+        predictions.append(weekday_level * trend)
+    return np.asarray(predictions, dtype=float)
+
+
+def blend_with_weekday_seasonal(target, model_prediction, seasonal_prediction):
+    params = SEASONAL_BLEND_PARAMS[target]
+    weight = params["model_weight"]
+    return params["scale"] * (
+        weight * np.asarray(model_prediction, dtype=float)
+        + (1.0 - weight) * np.asarray(seasonal_prediction, dtype=float)
+    )
+
+
 def date_features(date):
     return {
         "dayofweek": date.dayofweek,
@@ -100,7 +143,10 @@ def build_future_row(date, history, feature_cols, exog_values, history_df_full):
             recent = values[-window:] if len(values) >= window else values
             arr = np.array(recent)
             row[f"{target}_roll_mean_{window}"] = float(np.mean(arr))
-            row[f"{target}_roll_std_{window}"] = float(np.std(arr))
+            # pandas rolling().std() 在训练阶段采用样本标准差（ddof=1）。
+            row[f"{target}_roll_std_{window}"] = (
+                float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            )
             row[f"{target}_roll_min_{window}"] = float(np.min(arr))
             row[f"{target}_roll_max_{window}"] = float(np.max(arr))
             row[f"{target}_roll_median_{window}"] = float(np.median(arr))
@@ -157,7 +203,8 @@ def main():
                  "dayofweek_sin", "dayofweek_cos", "dayofmonth_sin", "dayofmonth_cos",
                  "month_sin", "month_cos", "days_to_month_start", "days_to_month_end",
                  "is_first_3_days", "is_last_3_days", "is_first_7_days", "is_last_7_days",
-                 "month_start_weight", "month_end_weight", "is_holiday",
+                 "month_start_weight", "month_end_weight",
+                 "purchase_month_start_mean", "redeem_month_start_mean", "is_holiday",
                  "days_to_next_holiday", "days_from_last_holiday",
                  "is_day_before_holiday", "is_day_after_holiday"}
     exog_cols = [
@@ -177,13 +224,9 @@ def main():
     r_lo = np.percentile(df["redeem"], 1)
     r_hi = np.percentile(df["redeem"], 99)
 
+    forecast_dates = pd.date_range("2014-09-01", "2014-09-30", freq="D")
     pred_rows = []
-    # 第五轮优化：月末3天上调（申购×1.2，赎回×1.3）
-    # 实验验证：月末资金集中进出，模型系统性低估，上调后多数月末日误差降到30%以下
-    # 验证集总分从5.19提升到5.43（零分日从9个减到6个）
-    LAST3_P_BOOST = 1.2
-    LAST3_R_BOOST = 1.3
-    for date in pd.date_range("2014-09-01", "2014-09-30", freq="D"):
+    for date in forecast_dates:
         X = build_future_row(date, history, feature_cols, exog_values, df)
         purchase_pred = float(np.expm1(model_purchase.predict(X)[0]))
         redeem_pred = float(np.expm1(model_redeem.predict(X)[0]))
@@ -195,13 +238,11 @@ def main():
         purchase_pred = 0.99 * purchase_pred + 0.01 * recent7_p
         redeem_pred = 0.99 * redeem_pred + 0.01 * recent7_r
 
-        # 月末3天上调（第五轮优化）
-        dim = date.days_in_month
-        if date.day >= dim - 2:
-            purchase_pred *= LAST3_P_BOOST
-            redeem_pred *= LAST3_R_BOOST
+        # 恢复线上 117.5507 分版本使用的月末修正。
+        if date.day >= date.days_in_month - 2:
+            purchase_pred *= 1.2
+            redeem_pred *= 1.3
 
-        # 裁剪到历史合理区间
         purchase_pred = float(np.clip(purchase_pred, p_lo, p_hi))
         redeem_pred = float(np.clip(redeem_pred, r_lo, r_hi))
         purchase_pred = max(0, purchase_pred)
@@ -218,7 +259,7 @@ def main():
         ], ignore_index=True)
 
     submission = pd.DataFrame(pred_rows)
-    submission.to_csv(SUBMISSION_PATH, index=False, header=False, encoding="utf-8-sig")
+    submission.to_csv(SUBMISSION_PATH, index=False, header=False, encoding="utf-8")
     submission.to_csv(SUBMISSION_WITH_HEADER_PATH, index=False, encoding="utf-8-sig")
     print(f"预测提交文件已保存到：{SUBMISSION_PATH}")
     print(f"带表头查看文件已保存到：{SUBMISSION_WITH_HEADER_PATH}")

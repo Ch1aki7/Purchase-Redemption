@@ -19,9 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "purchase_redemption.db"
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema.sql"
 RAW_DIR = ROOT / "Purchase Redemption Data"
-EXPLORATION_DIR = ROOT / "exploration_output"
-FEATURE_DIR = ROOT / "feature_engineering_output"
-MODELING_DIR = ROOT / "modeling_output"
+OUTPUT_DIR = ROOT / "output"
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -37,9 +35,33 @@ def run_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def clear_schema_managed_imports(conn: sqlite3.Connection) -> None:
+    """清空本轮将重建的数据，避免缺失输入时残留上一轮结果。"""
+    # user_balance 必须先于其父表 user_profile 清空。
+    for table in (
+        "user_balance",
+        "user_profile",
+        "mfd_day_share_interest",
+        "mfd_bank_shibor",
+        "comp_predict_template",
+        "daily_summary",
+        "daily_features",
+        "ml_train_data",
+        "ml_val_data",
+        "dataset_split",
+    ):
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if exists:
+            conn.execute(f'DELETE FROM "{table}"')
+    conn.commit()
+
+
 def import_user_profile(conn: sqlite3.Connection) -> int:
     df = pd.read_csv(RAW_DIR / "user_profile_table.csv")
-    df.to_sql("user_profile", conn, if_exists="replace", index=False)
+    df.to_sql("user_profile", conn, if_exists="append", index=False)
     return len(df)
 
 
@@ -50,13 +72,13 @@ def import_user_balance(conn: sqlite3.Connection) -> int:
         "yBalance": "y_balance",
     }
     df = df.rename(columns=rename)
-    df.to_sql("user_balance", conn, if_exists="replace", index=False)
+    df.to_sql("user_balance", conn, if_exists="append", index=False)
     return len(df)
 
 
 def import_yield(conn: sqlite3.Connection) -> int:
     df = pd.read_csv(RAW_DIR / "mfd_day_share_interest.csv")
-    df.to_sql("mfd_day_share_interest", conn, if_exists="replace", index=False)
+    df.to_sql("mfd_day_share_interest", conn, if_exists="append", index=False)
     return len(df)
 
 
@@ -64,7 +86,7 @@ def import_shibor(conn: sqlite3.Connection) -> int:
     df = pd.read_csv(RAW_DIR / "mfd_bank_shibor.csv")
     rename = {c: c.lower() for c in df.columns}
     df = df.rename(columns=rename)
-    df.to_sql("mfd_bank_shibor", conn, if_exists="replace", index=False)
+    df.to_sql("mfd_bank_shibor", conn, if_exists="append", index=False)
     return len(df)
 
 
@@ -74,22 +96,51 @@ def import_predict_template(conn: sqlite3.Connection) -> int:
         header=None,
         names=["report_date", "purchase", "redeem"],
     )
-    df.to_sql("comp_predict_template", conn, if_exists="replace", index=False)
+    df.to_sql("comp_predict_template", conn, if_exists="append", index=False)
     return len(df)
 
 
 def import_daily_summary(conn: sqlite3.Connection) -> int:
-    path = EXPLORATION_DIR / "daily_aggregation.csv"
-    if not path.exists():
-        print(f"  [跳过] daily_summary: 未找到 {path}")
-        return 0
-    df = pd.read_csv(path)
-    df.to_sql("daily_summary", conn, if_exists="replace", index=False)
-    return len(df)
+    # 直接从已导入的原始余额表聚合，完整填充 schema.sql 声明的探索指标。
+    conn.execute(
+        """
+        INSERT INTO daily_summary (
+            report_date, active_users, total_purchase, total_redeem,
+            direct_purchase, purchase_bal, purchase_bank, total_share,
+            total_consume, total_transfer, total_tftobal, total_tftocard,
+            cat1_total, cat2_total, cat3_total, cat4_total,
+            avg_balance, avg_yesterday_balance
+        )
+        SELECT
+            report_date,
+            COUNT(DISTINCT user_id),
+            SUM(total_purchase_amt),
+            SUM(total_redeem_amt),
+            SUM(direct_purchase_amt),
+            SUM(purchase_bal_amt),
+            SUM(purchase_bank_amt),
+            SUM(share_amt),
+            SUM(consume_amt),
+            SUM(transfer_amt),
+            SUM(tftobal_amt),
+            SUM(tftocard_amt),
+            SUM(category1),
+            SUM(category2),
+            SUM(category3),
+            SUM(category4),
+            AVG(t_balance),
+            AVG(y_balance)
+        FROM user_balance
+        GROUP BY report_date
+        ORDER BY report_date
+        """
+    )
+    conn.commit()
+    return conn.execute("SELECT COUNT(*) FROM daily_summary").fetchone()[0]
 
 
 def import_daily_features(conn: sqlite3.Connection) -> int:
-    path = FEATURE_DIR / "engineered_features.csv"
+    path = OUTPUT_DIR / "daily_features.csv"
     if not path.exists():
         print(f"  [跳过] daily_features: 未找到 {path}")
         return 0
@@ -99,22 +150,29 @@ def import_daily_features(conn: sqlite3.Connection) -> int:
 
 
 def import_ml_datasets(conn: sqlite3.Connection) -> tuple[int, int]:
-    train_path = MODELING_DIR / "train_data.csv"
-    val_path = MODELING_DIR / "val_data.csv"
-    train_n = val_n = 0
-    if train_path.exists():
-        df = pd.read_csv(train_path)
-        df.to_sql("ml_train_data", conn, if_exists="replace", index=False)
-        train_n = len(df)
-    else:
-        print(f"  [跳过] ml_train_data: 未找到 {train_path}")
-    if val_path.exists():
-        df = pd.read_csv(val_path)
-        df.to_sql("ml_val_data", conn, if_exists="replace", index=False)
-        val_n = len(df)
-    else:
-        print(f"  [跳过] ml_val_data: 未找到 {val_path}")
-    return train_n, val_n
+    path = OUTPUT_DIR / "daily_features.csv"
+    if not path.exists():
+        print(f"  [跳过] ml_train_data/ml_val_data: 未找到 {path}")
+        return 0, 0
+
+    df = pd.read_csv(path)
+    if "date" not in df.columns:
+        raise ValueError(f"{path} 缺少 date 列，无法切分训练集和验证集")
+
+    dates = pd.to_datetime(df["date"], errors="coerce")
+    if dates.isna().any():
+        raise ValueError(f"{path} 的 date 列包含无法解析的日期")
+
+    # 与 src/train.py 使用完全相同的日期范围，并提供 dataset_split 所需的整型日期键。
+    modeled = df.loc[dates >= pd.Timestamp("2013-08-01")].copy()
+    modeled.insert(0, "report_date", dates.loc[modeled.index].dt.strftime("%Y%m%d").astype(int))
+    train_df = modeled.loc[dates.loc[modeled.index] <= pd.Timestamp("2014-07-31")].copy()
+    val_mask = dates.loc[modeled.index].between("2014-08-01", "2014-08-31")
+    val_df = modeled.loc[val_mask].copy()
+
+    train_df.to_sql("ml_train_data", conn, if_exists="replace", index=False)
+    val_df.to_sql("ml_val_data", conn, if_exists="replace", index=False)
+    return len(train_df), len(val_df)
 
 
 def seed_dataset_split(conn: sqlite3.Connection) -> None:
@@ -133,17 +191,14 @@ def seed_dataset_split(conn: sqlite3.Connection) -> None:
         FROM ml_val_data
         """
     )
-    predict_dates = pd.read_csv(
-        RAW_DIR / "comp_predict_table.csv",
-        header=None,
-        names=["report_date", "purchase", "redeem"],
-    )["report_date"]
+    # 仓库内提交模板可能只保留少量示例行；预测范围始终是完整的 2014 年 9 月。
+    predict_dates = pd.date_range("2014-09-01", "2014-09-30", freq="D")
     conn.executemany(
         """
         INSERT INTO dataset_split (report_date, split_type, note)
         VALUES (?, 'predict', '2014-09 预测目标日')
         """,
-        [(int(d),) for d in predict_dates],
+        [(int(d.strftime("%Y%m%d")),) for d in predict_dates],
     )
     conn.commit()
 
@@ -257,6 +312,7 @@ def init_database(db_path: Path, force: bool = False) -> None:
     try:
         print("1. 执行 schema.sql ...")
         run_schema(conn)
+        clear_schema_managed_imports(conn)
 
         print("2. 导入原始数据 ...")
         print(f"   user_profile          {import_user_profile(conn):>10,} 行")

@@ -7,8 +7,12 @@ import pandas as pd
 
 from .config import BACKTEST_METRICS_PATH, BACKTEST_PRED_PATH, DAILY_FEATURES_PATH
 from .evaluate import evaluate_prediction
-from .predict import build_future_row
-from .train import build_lightgbm, fit_single_model, get_feature_columns
+from .predict import (
+    blend_with_weekday_seasonal,
+    build_future_row,
+    weekday_seasonal_forecast,
+)
+from .train import build_lightgbm, build_model, build_rf, fit_single_model, get_feature_columns
 
 
 LAG_ROLL_PREFIXES = (
@@ -23,7 +27,8 @@ TIME_COLUMNS = {
     "dayofmonth_cos", "month_sin", "month_cos", "days_to_month_start",
     "days_to_month_end", "is_first_3_days", "is_last_3_days",
     "is_first_7_days", "is_last_7_days", "month_start_weight",
-    "month_end_weight", "is_holiday", "days_to_next_holiday",
+    "month_end_weight", "purchase_month_start_mean", "redeem_month_start_mean",
+    "is_holiday", "days_to_next_holiday",
     "days_from_last_holiday", "is_day_before_holiday", "is_day_after_holiday",
 }
 
@@ -75,14 +80,30 @@ def train_refitted_ensemble(history, feature_cols, target, n_seeds):
     models = []
     best_iterations = []
     for seed in range(42, 42 + n_seeds):
-        tuned = fit_single_model(
-            build_lightgbm(seed=seed), X_fit, y_fit, X_tune, y_tune,
-            use_early_stop=True,
-        )
-        best_iteration = int(getattr(tuned, "best_iteration_", 0) or 10000)
-        final_model = build_lightgbm(seed=seed)
-        final_model.set_params(n_estimators=best_iteration)
-        final_model.fit(X_full, y_full)
+        candidate = build_model(seed=seed)
+        is_lightgbm = candidate.__class__.__module__.startswith("lightgbm")
+        try:
+            if is_lightgbm:
+                tuned = fit_single_model(
+                    candidate, X_fit, y_fit, X_tune, y_tune,
+                    use_early_stop=True,
+                )
+                best_iteration = int(getattr(tuned, "best_iteration_", 0) or 10000)
+                final_model = build_lightgbm(seed=seed, n_estimators=best_iteration)
+            else:
+                best_iteration = 0
+                final_model = candidate
+            final_model.fit(X_full, y_full)
+        except Exception as exc:
+            if not is_lightgbm:
+                raise
+            print(
+                f"LightGBM 回测训练失败（{exc}），"
+                f"种子 {seed} 自动降级为 RandomForestRegressor。"
+            )
+            best_iteration = 0
+            final_model = build_rf(seed=seed)
+            final_model.fit(X_full, y_full)
         models.append(final_model)
         best_iterations.append(best_iteration)
     return MeanModel(models), best_iterations
@@ -139,6 +160,7 @@ def evaluate_fold(df, feature_cols, period, n_seeds):
 
     prediction_frames = []
     metric_rows = []
+    base_prediction = None
     for strategy, use_boost in [("base", False), ("month_end_boost", True)]:
         pred = recursive_forecast(
             model_purchase, model_redeem, history,
@@ -157,6 +179,8 @@ def evaluate_fold(df, feature_cols, period, n_seeds):
         result["purchase_error"] = np.abs(result["purchase_pred"] - result["purchase_true"]) / result["purchase_true"].replace(0, 1)
         result["redeem_error"] = np.abs(result["redeem_pred"] - result["redeem_true"]) / result["redeem_true"].replace(0, 1)
         prediction_frames.append(result)
+        if strategy == "base":
+            base_prediction = pred.copy()
 
         metrics = evaluate_prediction(result)
         metric_rows.append({
@@ -167,6 +191,41 @@ def evaluate_fold(df, feature_cols, period, n_seeds):
             "redeem_best_iterations": "/".join(map(str, r_iters)),
         })
         print(f"[{period}] {strategy}: score={metrics['total_score']:.4f}")
+
+    seasonal_purchase = weekday_seasonal_forecast(
+        history, base_prediction["date"], "purchase"
+    )
+    seasonal_redeem = weekday_seasonal_forecast(
+        history, base_prediction["date"], "redeem"
+    )
+    blended = base_prediction.copy()
+    blended["purchase_pred"] = blend_with_weekday_seasonal(
+        "purchase", blended["purchase_pred"], seasonal_purchase
+    )
+    blended["redeem_pred"] = blend_with_weekday_seasonal(
+        "redeem", blended["redeem_pred"], seasonal_redeem
+    )
+    result = blended.merge(
+        actual[["date", "purchase", "redeem"]].rename(
+            columns={"purchase": "purchase_true", "redeem": "redeem_true"}
+        ),
+        on="date",
+        how="inner",
+    )
+    result["fold"] = str(period)
+    result["strategy"] = "seasonal_blend"
+    result["purchase_error"] = np.abs(result["purchase_pred"] - result["purchase_true"]) / result["purchase_true"].replace(0, 1)
+    result["redeem_error"] = np.abs(result["redeem_pred"] - result["redeem_true"]) / result["redeem_true"].replace(0, 1)
+    prediction_frames.append(result)
+    metrics = evaluate_prediction(result)
+    metric_rows.append({
+        "fold": str(period), "strategy": "seasonal_blend", **metrics,
+        "purchase_zero_score_days": int((result["purchase_error"] > 0.3).sum()),
+        "redeem_zero_score_days": int((result["redeem_error"] > 0.3).sum()),
+        "purchase_best_iterations": "/".join(map(str, p_iters)),
+        "redeem_best_iterations": "/".join(map(str, r_iters)),
+    })
+    print(f"[{period}] seasonal_blend: score={metrics['total_score']:.4f}")
     return prediction_frames, metric_rows
 
 

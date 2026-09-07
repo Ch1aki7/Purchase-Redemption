@@ -133,7 +133,8 @@ data/
 
 #### `comp_predict_template` — 提交格式模板
 
-2014 年 9 月 1–30 日的 `report_date` / `purchase` / `redeem` 样例。
+`report_date` / `purchase` / `redeem` 提交格式样例。仓库可只保留部分示例行；
+`dataset_split` 会独立生成 2014 年 9 月 1–30 日的完整预测日期。
 
 ---
 
@@ -141,13 +142,13 @@ data/
 
 #### `daily_summary` — 每日聚合（427 行）
 
-来自 `01_data_exploration.py` → `exploration_output/daily_aggregation.csv`。
+由 `database/init_db.py` 直接从 `user_balance` 按日期聚合生成。
 
 核心字段：`active_users`, `total_purchase`, `total_redeem`, 各细分金额, `avg_balance`。
 
-#### `daily_features` — 完整特征（427 × 204 列）
+#### `daily_features` — 完整特征（427 × 113 列）
 
-来自 `02_feature_engineering.py` → `feature_engineering_output/engineered_features.csv`。
+来自 `src/preprocess.py` → `output/daily_features.csv`。
 
 含时间、滞后、滚动窗口、收益率、Shibor、用户画像等特征，列由 CSV 表头动态生成。
 
@@ -163,10 +164,10 @@ data/
 
 | 表 | 日期范围 | 行数 |
 |----|----------|------|
-| `ml_train_data` | 2013-07-01 ~ 2014-07-31 | 396 |
+| `ml_train_data` | 2013-08-01 ~ 2014-07-31 | 365 |
 | `ml_val_data` | 2014-08-01 ~ 2014-08-31 | 31 |
 
-来自 `03_train_data_prepare.py` → `modeling_output/`。
+由 `database/init_db.py` 从 `output/daily_features.csv` 按当前训练日期范围切分生成。
 
 #### `dataset_split` — 划分标记
 
@@ -219,12 +220,10 @@ data/
 
 ### 前置条件
 
-先跑完三个 PySpark 预处理脚本，生成 CSV 输出：
+先运行当前预处理模块，生成日级特征文件：
 
 ```powershell
-python 01_data_exploration.py
-python 02_feature_engineering.py
-python 03_train_data_prepare.py
+python -m src.preprocess
 ```
 
 ### 初始化数据库

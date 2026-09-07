@@ -15,7 +15,7 @@ from .evaluate import evaluate_prediction
 from .predict import build_future_row
 
 
-def build_lightgbm(seed=42):
+def build_lightgbm(seed=42, n_estimators=10000):
     """LightGBM 调参版：更多树 + 小学习率 + 早停 + 正则化（第四轮调优实验最优配置）。
 
     第四轮调优实验发现：learning_rate=0.001, n_estimators=10000 比原配置
@@ -23,7 +23,7 @@ def build_lightgbm(seed=42):
     """
     from lightgbm import LGBMRegressor
     return LGBMRegressor(
-        n_estimators=10000,
+        n_estimators=n_estimators,
         learning_rate=0.001,
         num_leaves=31,
         max_depth=-1,
@@ -39,24 +39,23 @@ def build_lightgbm(seed=42):
     )
 
 
-def build_rf():
+def build_rf(seed=42):
     """RandomForest 作为集成成员 + 降级方案。"""
     return RandomForestRegressor(
         n_estimators=300,
         max_depth=15,
         min_samples_leaf=3,
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
     )
 
 
-def build_model():
+def build_model(seed=42):
     try:
-        from lightgbm import LGBMRegressor
-        return build_lightgbm()
-    except Exception:
-        print("未能使用 LightGBM，自动降级为 RandomForestRegressor。")
-        return build_rf()
+        return build_lightgbm(seed=seed)
+    except Exception as exc:
+        print(f"未能使用 LightGBM（{exc}），自动降级为 RandomForestRegressor。")
+        return build_rf(seed=seed)
 
 
 def get_feature_columns(df: pd.DataFrame):
@@ -101,14 +100,37 @@ class EnsembleModel:
         self.rf_model = None
         self.use_ensemble = False  # 是否使用 RF
 
-    def fit(self, X_train, y_train, X_valid, y_valid):
-        # 多种子 LightGBM
+    def fit(self, X_train, y_train):
+        """在训练期内部早停选轮数，再用完整训练期重训最终模型。"""
+        tune_size = min(31, max(1, len(X_train) // 5))
+        can_early_stop = len(X_train) > tune_size
+        if can_early_stop:
+            X_fit, X_tune = X_train.iloc[:-tune_size], X_train.iloc[-tune_size:]
+            y_fit, y_tune = y_train.iloc[:-tune_size], y_train.iloc[-tune_size:]
+
+        # 多种子模型；LightGBM 不可用或训练失败时自动降级为 RandomForest。
         self.lgb_models = []
         for seed in range(42, 42 + self.n_seeds):
-            m = build_lightgbm(seed=seed)
-            m = fit_single_model(
-                m, X_train, y_train, X_valid, y_valid, use_early_stop=True
-            )
+            m = build_model(seed=seed)
+            is_lightgbm = m.__class__.__module__.startswith("lightgbm")
+            try:
+                if is_lightgbm and can_early_stop:
+                    tuned = fit_single_model(
+                        m, X_fit, y_fit, X_tune, y_tune, use_early_stop=True
+                    )
+                    best_iteration = int(getattr(tuned, "best_iteration_", 0) or 0)
+                    final_estimators = best_iteration if best_iteration > 0 else 10000
+                    m = build_lightgbm(seed=seed, n_estimators=final_estimators)
+                m.fit(X_train, y_train)
+            except Exception as exc:
+                if not is_lightgbm:
+                    raise
+                print(
+                    f"LightGBM 训练失败（{exc}），"
+                    f"种子 {seed} 自动降级为 RandomForestRegressor。"
+                )
+                m = build_rf(seed=seed)
+                m.fit(X_train, y_train)
             self.lgb_models.append(m)
         # RandomForest 保留接口但不使用（调优实验证明权重0最优）
         if self.rf_weight > 0:
@@ -152,17 +174,14 @@ def main():
 
     y_purchase_train = np.log1p(train_df["purchase"])
     y_redeem_train = np.log1p(train_df["redeem"])
-    y_purchase_valid = np.log1p(valid_df["purchase"])
-    y_redeem_valid = np.log1p(valid_df["redeem"])
-
-    # 训练集成模型（调参实验最优配置：纯LightGBM，权重1.0）
+    # 训练集成模型：只在训练期内部早停，8 月完全留作最终验证。
     print("训练申购集成模型...")
     model_purchase = EnsembleModel(lgb_weight=1.0, rf_weight=0.0)
-    model_purchase.fit(X_train, y_purchase_train, X_valid, y_purchase_valid)
+    model_purchase.fit(X_train, y_purchase_train)
 
     print("训练赎回集成模型...")
     model_redeem = EnsembleModel(lgb_weight=1.0, rf_weight=0.0)
-    model_redeem.fit(X_train, y_redeem_train, X_valid, y_redeem_valid)
+    model_redeem.fit(X_train, y_redeem_train)
 
     # 验证集采用滚动预测（与9月预测逻辑一致，避免使用8月真实历史导致分数虚高）
     # 逐天预测8月1日→8月31日，预测值回填为下一天的 lag 特征
@@ -176,7 +195,8 @@ def main():
                  "dayofweek_sin", "dayofweek_cos", "dayofmonth_sin", "dayofmonth_cos",
                  "month_sin", "month_cos", "days_to_month_start", "days_to_month_end",
                  "is_first_3_days", "is_last_3_days", "is_first_7_days", "is_last_7_days",
-                 "month_start_weight", "month_end_weight", "is_holiday",
+                 "month_start_weight", "month_end_weight",
+                 "purchase_month_start_mean", "redeem_month_start_mean", "is_holiday",
                  "days_to_next_holiday", "days_from_last_holiday",
                  "is_day_before_holiday", "is_day_after_holiday"}
     exog_cols = [
@@ -199,11 +219,6 @@ def main():
     history = train_df[["date", "purchase", "redeem"]].copy()
     valid_dates = pd.date_range("2014-08-01", "2014-08-31", freq="D")
     pred_rows = []
-    # 第五轮优化：月末3天上调（申购×1.2，赎回×1.3）
-    # 实验验证：零分日从9个减到6个，总分从5.19提升到5.43
-    # 原因：月末资金集中进出，模型系统性低估，上调后多数月末日误差降到30%以下
-    LAST3_P_BOOST = 1.2
-    LAST3_R_BOOST = 1.3
     for date in valid_dates:
         X = build_future_row(date, history, feature_cols, exog_values_aug, df)
         p_pred = float(np.expm1(model_purchase.predict(X)[0]))
@@ -214,12 +229,9 @@ def main():
         recent7_r = float(history["redeem"].tail(7).mean())
         p_pred = 0.99 * p_pred + 0.01 * recent7_p
         r_pred = 0.99 * r_pred + 0.01 * recent7_r
-        # 月末3天上调（第五轮优化）
-        dim = date.days_in_month
-        if date.day >= dim - 2:
-            p_pred *= LAST3_P_BOOST
-            r_pred *= LAST3_R_BOOST
-        # 裁剪
+        if date.day >= date.days_in_month - 2:
+            p_pred *= 1.2
+            r_pred *= 1.3
         p_pred = float(np.clip(p_pred, p_lo, p_hi))
         r_pred = float(np.clip(r_pred, r_lo, r_hi))
         p_pred = max(0, p_pred)
@@ -248,9 +260,21 @@ def main():
     print("MAPE purchase:", mean_absolute_percentage_error(valid_result["purchase_true"], valid_result["purchase_pred"]))
     print("MAPE redeem:", mean_absolute_percentage_error(valid_result["redeem_true"], valid_result["redeem_pred"]))
 
-    # 保存集成模型对象
-    joblib.dump(model_purchase, MODEL_PURCHASE_PATH)
-    joblib.dump(model_redeem, MODEL_REDEEM_PATH)
+    # 8 月只用于上面的无泄露评估。评估完成后，用截至 8 月 31 日的全部
+    # 已知数据重训正式模型，供 9 月预测使用。
+    print("使用截至 2014-08-31 的全部数据重训正式申购模型...")
+    X_final = df[feature_cols].fillna(0)
+    y_purchase_final = np.log1p(df["purchase"])
+    y_redeem_final = np.log1p(df["redeem"])
+
+    final_model_purchase = EnsembleModel(lgb_weight=1.0, rf_weight=0.0)
+    final_model_purchase.fit(X_final, y_purchase_final)
+    print("使用截至 2014-08-31 的全部数据重训正式赎回模型...")
+    final_model_redeem = EnsembleModel(lgb_weight=1.0, rf_weight=0.0)
+    final_model_redeem.fit(X_final, y_redeem_final)
+
+    joblib.dump(final_model_purchase, MODEL_PURCHASE_PATH)
+    joblib.dump(final_model_redeem, MODEL_REDEEM_PATH)
     with open(FEATURE_COLUMNS_PATH, "w", encoding="utf-8") as f:
         json.dump(feature_cols, f, ensure_ascii=False, indent=2)
 

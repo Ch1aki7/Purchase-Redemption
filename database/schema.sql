@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     avg_yesterday_balance REAL
 );
 
--- 完整特征表：列结构与 engineered_features.csv 对齐，由 init_db.py 动态建表/导入
+-- 完整特征表：列结构与 output/daily_features.csv 对齐，由 init_db.py 动态建表/导入
 -- 此处仅声明核心字段，完整列在导入脚本中处理
 
 CREATE TABLE IF NOT EXISTS daily_features_meta (
