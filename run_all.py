@@ -1,12 +1,23 @@
-from src.preprocess import main as preprocess_main
-from src.train import main as train_main
-from src.predict import main as predict_main
+"""一键可重复运行，按数据 -> 特征 -> 回测 -> 训练 -> 预测顺序执行。"""
+from src.preprocess import preprocess
+from src.feature_engineering import make_features,validate_no_leakage
+from src.config import PROCESSED_DATA_DIR, OUTPUT_DIR
+from src.eda import eda_figures
+from src.backtest import run_backtest
+from src.train import train_final
+from src.predict import predict_final
 
-if __name__ == "__main__":
-    print("[1/3] 数据预处理与特征工程...")
-    preprocess_main()
-    print("[2/3] 模型训练与验证...")
-    train_main()
-    print("[3/3] 预测 2014 年 9 月 30 天结果...")
-    predict_main()
-    print("全部流程已完成。请查看 output/tc_comp_predict_table.csv")
+def main():
+    """每步失败立即停止，避免拿旧结果伪装成功。"""
+    d=preprocess()
+    x=make_features(d,True)
+    validate_no_leakage(d,features=x,enriched=True)
+    x.to_csv(PROCESSED_DATA_DIR/'features.csv',index_label='date')
+    for name, fig in eda_figures(d).items():
+        fig.write_html(OUTPUT_DIR/(name+".html"), include_plotlyjs=True)
+    run_backtest(d)
+    train_final()
+    print(predict_final())
+
+if __name__=='__main__':
+    main()

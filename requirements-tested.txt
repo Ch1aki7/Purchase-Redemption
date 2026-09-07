@@ -1,0 +1,9 @@
+# 实测环境 Python 3.13，用于复现实验
+pandas==3.0.3
+numpy==2.5.1
+scikit-learn==1.9.0
+matplotlib==3.11.1
+plotly==7.0.0
+streamlit==1.63.0
+joblib==1.6.0
+statsmodels==0.15.0

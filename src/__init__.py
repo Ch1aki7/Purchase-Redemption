@@ -1,1 +1,1 @@
-# Purchase-Redemption source package
+"""资金流入流出预测系统。"""

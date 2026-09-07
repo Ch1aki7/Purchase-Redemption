@@ -1,443 +1,302 @@
-# Purchase-Redemption 资金流入流出预测系统
+# 资金流入流出预测系统
 
-本项目基于天池“资金流入流出预测”赛题，实现余额宝每日申购额和赎回额预测。项目已整理为适合提交到 GitHub 的版本：**代码、报告、说明文档可以提交；原始数据文件不提交**。
+## 项目背景
 
-## 一、项目说明
+依据《大数据技术项目实训》指导书项目二，使用余额宝用户交易、用户画像、收益率及SHIBOR预测平台每日资金流，支持流动性、现金储备与资金配置分析。历史2013-07-01至2014-08-31，预测2014-09-01至09-30。
 
-目标：根据 2013-07-01 至 2014-08-31 的历史数据，预测 2014-09-01 至 2014-09-30 每日资金申购总额 `purchase` 和赎回总额 `redeem`。
+已实际运行数据审计、特征工程、13种候选方案三折回测、独立目标训练、融合和30天预测，提供十页Streamlit系统。九月没有真实标签，因此没有九月真实误差或官方得分。
 
-本项目包含：
+## 数据说明
 
-- 数据读取与预处理
-- 用户余额一致性校验，并输出数据质量报告
-- 每日申购/赎回聚合
-- 多维特征工程：周期傅里叶编码、法定节假日/调休工作日、月初月末工作日、滞后/滚动统计、历史同期及用户行为日级聚合（全部基于历史值，无数据泄露）
-- 浅层 XGBoost 三种子集成建模，滚动预测评估（验证集与9月预测逻辑一致）
-- 2014 年 8 月验证集评估
-- 2014 年 9 月滚动预测
-- Streamlit 可视化展示
-- 课程需求分析文档
+程序自动读取 data/ 下的CSV（排除processed）。首次运行会将 Purchase Redemption Data/ 中五个CSV复制到 data/raw，源文件保持不变。
 
-## 二、目录结构
+|表|实际规模|关联与用途|
+|---|---:|---|
+|user_balance_table|2,840,421 × 18|按用户日记录聚合平台资金流|
+|user_profile_table|28,041 × 4|user_id多对一关联性别、城市、星座|
+|mfd_day_share_interest|427 × 3|按日期关联每日收益、七日收益|
+|mfd_bank_shibor|294 × 9|按日期关联隔夜到一年各期限报价|
+|comp_predict_table|3 × 3，无表头|格式样例，隔离，绝不参与训练|
 
-```text
+真实映射：report_date/mfd_date → date；total_purchase_amt → purchase；total_redeem_amt → redeem；tBalance/yBalance → balance/previous_balance；mfd_daily_yield → yield_rate；Interest_O_N → shibor_overnight。完整columns、dtypes、head、统计、缺失率、日期范围与映射见 output/data_quality_report.json。
+
+金额保留原始单位，指导书未明确单位换算，不擅自换算为元。category1–4 各缺失约93.88%，不进入模型。没有年龄、等级或注册日期，不虚构字段。余额仅1条相差100，原样保留。总申购已含收益，总赎回已含消费与转出，不能重复加减。详见 [质量报告](output/data_quality_report.md)。
+
+## 项目结构
+
+~~~text
 Purchase-Redemption/
-├── Purchase Redemption Data/                 # 原始赛题数据目录（不提交 Git）
-│   ├── user_balance_table.csv               # 用户申购赎回表（核心大表，约 150MB）
-│   ├── user_profile_table.csv               # 用户信息表（性别/城市/星座）
-│   ├── mfd_day_share_interest.csv            # 余额宝收益率表（万份收益/7日年化）
-│   ├── mfd_bank_shibor.csv                   # Shibor 同业拆借利率表（8个期限）
-│   ├── comp_predict_table.csv               # 赛题官方提交示例文件
-│   └── README.txt                            # 数据说明文档
-│
-├── src/                                      # 核心源码包
-│   ├── __init__.py                           # 包初始化文件，使 src 可作为模块导入
-│   ├── config.py                             # 路径配置（统一管理所有输入输出路径）
-│   ├── data_loader.py                        # 数据读取（加载4张原始表并做基本清洗）
-│   ├── preprocess.py                         # 预处理与特征工程（生成214列日级宽表）
-│   ├── calendar_features.py                  # 节假日、调休与工作日位置特征
-│   ├── behavior_features.py                  # 用户交易结构的历史聚合特征
-│   ├── ensemble.py                           # 可稳定序列化的多种子模型封装
-│   ├── train.py                              # 模型训练与验证（多种子 XGBoost 集成）
-│   ├── backtest.py                           # 扩展窗口递归滚动回测与实验策略
-│   ├── predict.py                            # 9月滚动预测与提交文件生成
-│   └── evaluate.py                           # 评估函数（MAPE与模拟评分计算）
-│
-├── output/                                   # 运行结果输出目录（运行后生成）
-│   ├── daily_features.csv                    # 预处理后的日级训练数据（含全部特征）
-│   ├── data_quality_report.csv               # 数据质量报告（余额一致性校验）
-│   ├── validation_prediction.csv             # 8月验证集预测结果（含真实值/预测值/误差）
-│   ├── tc_comp_predict_table.csv             # 9月最终预测提交文件（无表头，赛题格式）
-│   └── tc_comp_predict_table_with_header.csv # 9月预测带表头版本（便于查看）
-│
-├── models/                                   # 训练好的模型文件目录（运行后生成）
-│   ├── model_purchase.pkl                    # 申购预测模型（多种子 XGBoost 集成）
-│   ├── model_redeem.pkl                      # 赎回预测模型（多种子 XGBoost 集成）
-│   └── feature_columns.json                  # 特征列名清单（预测时保持特征一致）
-│
-├── app.py                                    # Streamlit 可视化系统主入口
-├── run_all.py                                # 一键运行完整流程（预处理→训练→预测）
-├── requirements.txt                          # Python 依赖清单
-├── Purchase Redemption Data.zip              # 原始数据压缩包（备份，不提交 Git）
-├── 设计报告.md                                # 面向课程指导书要求的项目设计报告
-├── 项目二_需求分析与最小方案.md                # 课程需求分析与方案设计文档
-├── LICENSE                                   # 开源许可证（MIT）
-└── .gitignore                                # Git 忽略规则
-```
+├── app.py                         # 十页Web
+├── run_all.py                     # 一键流水线
+├── start_web.bat                  # Windows启动
+├── requirements.txt
+├── requirements-tested.txt       # 实际验证版本
+├── README.md
+├── inspect_data.py
+├── build_reports.py
+├── data/
+│   ├── raw/                      # 五个CSV的原始副本
+│   └── processed/
+│       ├── daily_balance.csv
+│       ├── features.csv
+│       └── validation_report.csv
+├── models/
+│   ├── purchase/*.joblib
+│   ├── redeem/*.joblib
+│   └── manifest.json             # 参数、权重、训练截止
+├── output/
+│   ├── prediction_201409.csv
+│   ├── prediction_201409_no_header.csv
+│   ├── validation_predictions.csv
+│   ├── metrics.csv
+│   ├── model_comparison.csv
+│   ├── holdout_comparison.csv
+│   ├── feature_importance.csv
+│   ├── error_analysis.csv
+│   ├── error_insights.txt
+│   ├── data_quality_report.json / .md
+│   ├── balance_consistency.json
+│   ├── balance_anomaly_samples.csv
+│   ├── leakage_audit.json
+│   ├── prediction_validation.json
+│   ├── experiment_report.md
+│   ├── pipeline.log
+│   └── *.html                    # 离线Plotly图
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── data_loader.py
+│   ├── preprocess.py
+│   ├── behavior_features.py
+│   ├── calendar_features.py
+│   ├── feature_engineering.py
+│   ├── eda.py
+│   ├── models.py
+│   ├── metrics.py
+│   ├── backtest.py
+│   ├── ensemble.py
+│   ├── train.py
+│   ├── predict.py
+│   └── utils.py
+└── tests/
+    ├── test_pipeline.py
+    ├── test_artifacts.py
+    └── check_web.py
+~~~
 
-### 关键文件说明
+## 安装
 
-**源码模块（`src/`）**
+Python 3.10+。实际验证为Windows、Python 3.13；其他版本根据requirements.txt解析兼容依赖，未逐版本测试。
 
-| 文件 | 作用 | 关键函数 |
-|---|---|---|
-| `config.py` | 集中管理所有文件路径，避免硬编码 | `DAILY_FEATURES_PATH`、`MODEL_PURCHASE_PATH` 等 |
-| `data_loader.py` | 读取4张原始 CSV，解析日期，返回 DataFrame | `load_user_balance()`、`load_share_interest()` 等 |
-| `preprocess.py` | 聚合每日总量，生成214列日级宽表并保存 | `preprocess_and_feature_engineering()` |
-| `calendar_features.py` | 生成法定节假日、调休和月内工作日位置特征 | `calendar_feature_dict()` |
-| `behavior_features.py` | 生成用户交易人数、大额交易和渠道占比的严格历史统计 | `add_behavior_history_features()` |
-| `train.py` | 训练3种子浅层 XGBoost 集成模型，用8月做递归验证 | `build_xgboost()` |
-| `backtest.py` | 比较模型、目标形式和实验策略 | `run_backtest()` |
-| `auto_tune.py` | 随机生成大量模型参数并复用预测测试平滑/周期权重，支持断点续跑 | `evaluate_model_config()` |
-| `predict.py` | 对9月30天做滚动预测，生成赛题提交格式文件 | `rolling_predict()` |
-| `evaluate.py` | 计算 MAPE 和模拟评分，供训练和可视化共用 | `evaluate_prediction()` |
+~~~bash
+python -m venv .venv
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+~~~
 
-**运行结果（`output/`）**
+精确复现建议Python 3.13安装requirements-tested.txt。依赖版本改变后请重新训练，避免旧joblib模型兼容问题。预处理读取约158MB交易表，建议至少4GB可用内存，8GB更稳妥。
 
-| 文件 | 作用 | 生成阶段 |
-|---|---|---|
-| `daily_features.csv` | 预处理后的日级宽表，每行一天，共214列；正式模型使用其中125个可预测特征 | `preprocess.py` 运行后 |
-| `data_quality_report.csv` | 数据质量报告，统计余额一致性校验结果 | `preprocess.py` 运行后 |
-| `validation_prediction.csv` | 8月验证集预测对比，含 date、purchase_true/pred、redeem_true/pred | `train.py` 运行后 |
-| `tc_comp_predict_table.csv` | 9月预测提交文件，无表头，格式为 `report_date,purchase,redeem`，共30行 | `predict.py` 运行后 |
-| `tc_comp_predict_table_with_header.csv` | 带表头版本，便于人工查看和可视化展示 | `predict.py` 运行后 |
+可选：python -m pip install xgboost lightgbm。缺少这两个包时交互训练明确回退HistGradientBoosting；缺少statsmodels时TimeSeries明确回退Weekly。默认流程不依赖XGBoost、LightGBM或SHAP。
 
-**模型文件（`models/`）**
+## 一键运行
 
-| 文件 | 作用 |
-|---|---|
-| `model_purchase.pkl` | 申购预测模型，`joblib` 序列化的多种子 XGBoost 集成对象 |
-| `model_redeem.pkl` | 赎回预测模型，同上 |
-| `feature_columns.json` | 训练时的特征列名顺序，预测时必须保持一致 |
-
-**原始数据（`Purchase Redemption Data/`）**
-
-| 文件 | 说明 |
-|---|---|
-| `user_balance_table.csv` | 约 280 万条用户交易记录，覆盖 2013.07.01~2014.08.31，是聚合每日总量的数据源 |
-| `user_profile_table.csv` | 约 2.8 万用户的人口属性信息，本项目的每日总量预测未直接使用 |
-| `mfd_day_share_interest.csv` | 余额宝每日万份收益和7日年化收益率，作为外部特征 |
-| `mfd_bank_shibor.csv` | 8 个期限的 Shibor 利率，作为外部特征 |
-| `comp_predict_table.csv` | 赛题官方提交示例，参考格式用 |
-
-## 三、代码流程
-
-本章节阐释整个项目的运行逻辑，从原始数据到最终预测结果的完整链路。
-
-### 3.1 整体流程
-
-```
-Purchase Redemption Data/          原始数据（4张CSV表）
-        ↓
-src/preprocess.py                  预处理 + 特征工程
-        ↓
-output/daily_features.csv          日级宽表（214列，正式模型使用125个特征）
-        ↓
-src/train.py                       训练集成模型
-        ↓
-models/model_purchase.pkl          申购模型
-models/model_redeem.pkl            赎回模型
-models/feature_columns.json        特征列名契约
-        ↓
-output/validation_prediction.csv   8月验证集评估
-        ↓
-src/predict.py                     9月滚动预测
-        ↓
-output/tc_comp_predict_table.csv   赛题提交文件（30天预测）
-```
-
-### 3.2 各阶段详解
-
-**阶段1：预处理与特征工程（`src/preprocess.py`）**
-
-- 从 `user_balance_table.csv` 按 `report_date` 聚合，得到每日 `purchase` 和 `redeem` 总量
-- 校验 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`，输出 `output/data_quality_report.csv`
-- 合并收益率表和 Shibor 利率表
-- 生成 214 列日级宽表；正式模型筛选其中 125 个预测时可获得且回测有效的特征
-- 节假日特征同时区分法定假日、调休工作日、节前/节后和月内第几个工作日
-- 用户行为与4/8/12周同星期统计保留在宽表供分析，但因五个月滚动回测降分，默认模型不直接使用
-- 输出 `output/daily_features.csv`
-
-**阶段2：模型训练（`src/train.py`）**
-
-- 读取 `daily_features.csv`，按日期切分：训练集 2013.08~2014.07，验证集 2014.08
-- 对 `purchase` 和 `redeem` 分别训练 `EnsembleModel`（3个不同随机种子的浅层 XGBoost 平均）
-- 训练时目标做 `log1p` 变换（日总量上亿分，取对数稳定方差）
-- XGBoost 使用深度2、学习率0.02、最多2000棵树，并用验证集做100轮早停
-- **验证集评估采用滚动预测**：逐天预测8月1日→8月31日，预测值回填为下一天 lag 特征，与 9 月预测逻辑完全一致，避免使用8月真实历史导致分数虚高
-- 用 `joblib.dump` 保存模型到 `models/`，同时保存特征列名到 `feature_columns.json`
-
-**阶段3：9月滚动预测（`src/predict.py`）**
-
-- 用 `joblib.load` 加载模型，读取 `feature_columns.json` 对齐特征顺序
-- 逐天滚动预测：第 1 天用 8 月最后一天的特征预测，预测值回填为第 2 天的 lag 特征
-- 9 月的收益率和 Shibor（未来未知）用 8 月均值填充
-- 平滑修正：模型预测 × 0.99 + 近 7 日均值 × 0.01，缓解滚动漂移
-- 周期融合：申购采用 `100% XGBoost`；赎回采用 `50% XGBoost + 50% 最近12个同星期日均值`。周期锚点只修正输出，不进入模型递归 lag
-- 默认不做固定月末倍率修正；申购×1.2、赎回×1.3 只保留在滚动回测中作为实验策略
-- 八月验证完成后，使用选出的树数量在截至 2014-08-31 的全部数据上重拟合正式模型
-- 输出 `output/tc_comp_predict_table.csv`（无表头，赛题格式）和带表头版本
-
-### 3.3 models 目录文件说明
-
-`models/` 下的三个文件由 `src/train.py` 生成，供 `src/predict.py` 使用：
-
-| 文件 | 生成方式 | 用途 |
-|---|---|---|
-| `model_purchase.pkl` | `joblib.dump(EnsembleModel)` 保存申购预测模型 | `predict.py` 加载后做 9 月申购预测 |
-| `model_redeem.pkl` | 同上，保存赎回预测模型 | `predict.py` 加载后做 9 月赎回预测 |
-| `feature_columns.json` | `json.dump(feature_cols)` 保存 125 个入模特征及顺序 | `predict.py` 按此顺序构造特征矩阵，保证与训练一致 |
-
-**为什么不直接用，要保存？** 训练耗时几分钟，预测只需几秒。保存后可复用模型，不用每次预测都重训。
-
-**`feature_columns.json` 的作用**：训练和预测必须用完全一致的特征顺序，否则模型报错或预测错乱。重新预处理后特征列可能变化，此时需重训模型，这个 JSON 是训练与预测之间的「契约」。
-
-### 3.4 数据放置要求
-
-原始赛题数据不提交到 Git，运行前请把天池数据解压到：
-
-```text
-Purchase Redemption Data/
-```
-
-必需文件：
-
-```text
-user_balance_table.csv      # 核心大表，约 280 万条，缺它无法训练
-user_profile_table.csv
-mfd_day_share_interest.csv
-mfd_bank_shibor.csv
-```
-
-如果缺少 `user_balance_table.csv`，模型无法训练。
-
-**用户画像说明**：项目已读取 `user_profile_table`，但最终预测目标是每日申购/赎回总量，且测试期未来用户画像难以稳定映射到每日资金流；因此当前主模型未直接使用用户画像特征，而是在数据资产说明和可视化展示中保留其作用边界。
-
-**余额一致性说明**：指导书要求关注 `tBalance = yBalance + total_purchase_amt - total_redeem_amt`。项目已在 `src/preprocess.py` 中实现该校验，并输出 `output/data_quality_report.csv`。该报告只用于数据质量说明，不删除样本、不改变训练和预测逻辑。
-
-## 四、安装依赖
-
-建议使用 Python 3.8 或以上版本。
-
-```bash
-pip install -r requirements.txt
-```
-
-正式流程需要 `xgboost`；`lightgbm`、`scikit-learn` 模型保留用于回测对照和前端实验。
-
-## 五、一键运行
-
-在项目根目录执行：
-
-```bash
+~~~bash
 python run_all.py
-```
+~~~
 
-运行完成后会生成：
+顺序：预处理 → 特征校验 → 回测 → 全历史重训 → 最终预测。生成结果可覆盖，原始数据不会修改。如更换数据或候选模型，请完整重跑，避免混用旧selection.json。
 
-```text
-output/daily_features.csv
-output/data_quality_report.csv
-output/validation_prediction.csv
-output/tc_comp_predict_table.csv
-output/tc_comp_predict_table_with_header.csv
-models/model_purchase.pkl
-models/model_redeem.pkl
-models/feature_columns.json
-```
+## 数据预处理
 
-文件说明：
+~~~bash
+python -m src.preprocess
+python -m src.feature_engineering
+python -m src.eda
+~~~
 
-| 文件 | 作用 |
-|---|---|
-| `daily_features.csv` | 预处理和特征工程后的日级训练数据 |
-| `data_quality_report.csv` | 数据质量报告，记录余额一致性校验统计 |
-| `validation_prediction.csv` | 2014 年 8 月验证集预测结果，用于评估模型效果 |
-| `tc_comp_predict_table.csv` | 2014 年 9 月最终预测提交文件，默认无表头 |
-| `tc_comp_predict_table_with_header.csv` | 带表头版本，便于查看和展示 |
+缺失关键金额、无法解析的日期、日期缺口或重复主键会明确报错。余额异常仅报告，不删除。全样本IQR仅描述性标记，不参与清洗或建模。日志与异常样本保存在output。
 
-## 六、启动可视化系统
+## 模型训练
 
-```bash
-streamlit run app.py
-```
+~~~bash
+python -m src.train
+~~~
 
-页面包括：
+没有selection.json时先回测；已有时复用六月七月冻结权重。两目标独立训练、保存。候选参数在 src/models.py 的 model_specs() 统一声明。
 
-1. 数据探索：展示历史申购/赎回趋势、用户分布、收益率变化、Shibor 利率变化和数据质量报告
-2. 模型训练与评估：默认提供只保存在当前会话的快速交互训练；手动开启“正式滚动评估”后，可调整 XGBoost/LightGBM、树数量、深度、学习率、正则化、随机种子数、平滑及周期融合权重，执行8月递归评估并生成可下载的9月调参提交文件
-3. 预测结果展示：展示 2014 年 9 月预测结果，并下载无表头提交文件，同时展示验证集每日误差和得分
-4. 误差分析：展示验证集绝对误差、相对误差、每日得分、零分日、高估/低估方向和改进提示
+## 历史回测
 
-侧边栏提供“一键运行完整流程”按钮，会执行 `run_all.py` 并重新生成 `output/` 与 `models/`。网页中的快速交互训练和手动正式调参结果都只保存在当前 Streamlit 会话中，不覆盖默认正式结果文件；正式调参完成后可在“模型训练与评估”或“预测结果展示”页下载无表头提交文件。
-
-如果首次运行 Streamlit 出现邮箱提示，直接按回车跳过即可。
-
-## 七、如何判断预测是否可靠
-
-2014 年 9 月真实值属于隐藏测试集，本地无法直接知道最终预测是否完全正确。因此本项目使用 2014 年 8 月作为验证集，**采用与 9 月一致的滚动预测逻辑**（逐天预测，预测值回填为下一天的 lag 特征），评估模型在未来 30 天上的真实表现。
-
-**关于评分公式**：指导书明确「误差与得分之间的计算公式不公布」，只保证 error=0 得 10 分、error>0.3 得 0 分、单调递减。本项目采用线性近似公式 `score = max(0, 10×(1-error/0.3))` 做课程项目内的模拟评估，**该分数为内部模拟值，非天池官方成绩**。
-
-当前验证集评估结果（线性近似公式，满分 10）：
-
-| 指标 | 数值 |
-|---|---|
-| 申购 MAPE | 15.79% |
-| 赎回 MAPE | 17.67% |
-| 申购评分 | 5.00 |
-| 赎回评分 | 4.74 |
-| **模拟总分** | **4.8558** |
-| 申购零分日（误差>30%） | 4 天 |
-| 赎回零分日（误差>30%） | 6 天 |
-
-**关于分数**：该分数是在**无数据泄露、验证集滚动预测**条件下得到的本地近似结果。早期版本曾因验证集使用 8 月真实历史而虚高至 8.14，已修正。当前浅层 XGBoost 方案的 8 月严格递归验证分为 **4.8558**；更重要的是，三种子五个月整体分数为 **4.7038**，高于上一版周期融合的 **4.5721（约 +2.9%）**。固定月末倍率的五个月整体仅 **4.4879**，仍只作为实验策略。
-
-评估结果主要查看：
-
-- 申购 MAPE
-- 赎回 MAPE
-- 模拟总分
-- 真实值与预测值折线图是否接近
-
-最终 `tc_comp_predict_table.csv` 可用于赛题平台或课程结果展示。
-
-## 八、提交到 GitHub
-
-本项目已经配置 `.gitignore`，默认不会提交：
-
-- 原始数据文件
-- 运行生成的模型文件
-- 运行生成的输出结果
-- 压缩包
-- Python 缓存文件
-
-日常更新代码只需：
-
-```bash
-git add .
-git commit -m "你的提交说明"
-git push
-```
-
-若首次复现本仓库到新的本地目录，用 `git clone https://github.com/Ch1aki7/Purchase-Redemption.git` 即可。
-
-## 九、原项目文件说明
-
-当前推荐运行主流程为：
-
-```bash
-python run_all.py
-streamlit run app.py
-```
-
-项目已集成端到端流程：数据预处理 → 特征工程 → 多种子浅层 XGBoost 集成训练 → 滚动预测 → 可视化展示。默认预测不做固定月末倍率修正；历史单月实验分数不作为主流程选型依据，应以多月份滚动回测结果评估泛化能力。
-
-## 十、滚动回测
-
-为避免只在 2014 年 8 月上调参导致结论偏乐观，可以对多个历史月份执行扩展窗口回测。每个回测折只使用目标月份之前的数据；目标月内逐日递归预测，并把预测值回填为后续日期的滞后特征。新选型优先使用加权 MAPE、P90 尾部误差、超过20%/30%的严重错误比例和风险调整损失；旧模拟分仅保留兼容展示。
-
-快速回测默认使用 1 个浅层 XGBoost 随机种子，评估 2014 年 4 月至 8 月：
-
-```bash
+~~~bash
 python -m src.backtest
-```
+~~~
 
-如需使用与正式模型相同的 3 种子集成：
+|Fold|训练截止|验证区间|用途|
+|---|---|---|---|
+|1|2014-05-31|2014-06-01—06-30|开发|
+|2|2014-06-30|2014-07-01—07-31|开发|
+|3|2014-07-31|2014-08-01—08-31|独立检验|
 
-```bash
-python -m src.backtest --n-seeds 3
-```
+每月固定起点重训，整月递归预测；不是月内每日获得真实值后做单步预测。融合按目标搜索最佳单模型/两模型凸组合（0.1步长）。在线融合六月预设Weekly，七月只用六月，八月只用六月七月。最终权重用六月七月，八月不反向调参。开发期拟合融合成绩有选型乐观偏差。
 
-参数筛选与独立确认应分开执行：
+## 生成最终预测
 
-```bash
-python -m src.backtest --stage development --n-seeds 3
-python -m src.backtest --stage confirm --n-seeds 3
-```
+~~~bash
+python -m src.predict
+~~~
 
-`development` 只包含2014年4—7月，`confirm` 只包含2014年8月；不指定时使用 `all` 生成完整五个月报告。
+output/prediction_201409.csv 含date,purchase,redeem表头；日期YYYYMMDD，30天，金额四舍五入为int64。另有prediction_201409_no_header.csv，与原始样例无表头格式一致。逐模型记录负预测截断数，拒绝NaN与inf。
 
-也可以指定月份：
+第1天lag来自历史；以后来自真实历史加已预测值，两目标同步递归。整段预测不接收验证真实金额。
 
-```bash
-python -m src.backtest --months 2014-06 2014-07 2014-08
-```
+## 启动系统
 
-回测会同时比较纯模型、默认周期融合和月末上调实验策略，输出：
+~~~bash
+streamlit run app.py
+# 或
+python -m streamlit run app.py
+~~~
 
-```text
-output/rolling_backtest_predictions.csv
-output/rolling_backtest_metrics.csv
-```
+访问 http://localhost:8501 ，或双击start_web.bat。页面：项目概览、数据探索、特征分析、模型训练、模型评估、滚动回测、未来预测、误差分析。
 
-早停月份取自目标月之前；确定迭代轮数后，模型会使用目标月之前的全部历史重新拟合，避免用待评估月份选择树数量。
+图表支持hover、缩放、图例开关，EDA支持时间范围。训练支持目标、模型、核心超参数、扩展特征和验证月选择。交互实验保留在会话中，不覆盖正式模型与提交。单目标实验另一目标以Weekly递归生成跨目标lag，页面明确标注。没有适用loss曲线时展示真实Fold误差，不伪造loss。
 
-### 正式回测结果（三种子）
+## 模型说明
 
-| 月份 | 纯模型 | 周期融合（默认） | 月末倍率实验 |
+- Yesterday、Weekly、MA7/14/30、SameWeekday：六类递归基线。
+- Ridge：填充与标准化只fit训练集。
+- RandomForest、GradientBoosting、HistGradientBoosting：独立目标回归、固定随机种子。
+- RandomForest_enriched：附加滞后画像、行为与利率，检验其预测价值。
+- Redeem_smooth：更大叶节点和较低学习率的树候选，重点检查赎回稳定性。
+- TimeSeries：Holt-Winters加性周季节、阻尼趋势。
+- Ensemble：不同目标独立选择组合和权重。
+
+每个候选均训练两个独立模型。回归目标使用固定1e8缩放改善数值尺度，输出还原；该常量不由全样本估计。HistGradientBoosting禁用内部随机验证early stopping。解释使用真实树重要性或Ridge标准化系数绝对值，SHAP不是强制依赖。
+
+## 特征说明
+
+日历包括年/月/日、星期、月内日期、周数、周末、月初/月末/季初/季末、距月初/月末天数和星期/月内日期/月的周期编码。
+
+lag为1/2/3/7/14/21/28/30天。rolling均值、最小、最大、中位数为3/7/14/30天，样本标准差为7/14/30天。必须先shift(1)，最初30天暖启动不参加回归拟合。
+
+每日聚合含金额、净流入、人数与比例、均值/中位余额、首次观测比例、性别比例。模型只用有限预定义滞后列；城市、星座分布仅EDA。总申购含收益，所以“活跃”包含仅收益入账者；首次观测不等于注册。
+
+利率仅forward fill，再lag_1。未来行为、收益率、SHIBOR固定预测起点最后已知值，回测使用同一策略。未来日历可事先知道；没有可靠节假日/调休清单，不虚构假日。
+
+## 评价指标
+
+relative_error = abs(pred-actual) / max(abs(actual),epsilon)，epsilon=1个原始金额单位。输出MAE、RMSE、MAPE（百分比）、相对误差和近零目标数量。分母下限防止除零；近零值仍需结合MAE判断。
+
+Weighted_Error = 0.45 × Purchase平均相对误差 + 0.55 × Redeem平均相对误差。
+
+模拟评分 = 10 × max(0,1-relative_error/0.3)，按天求和后45%/55%加权。**模拟评分不代表官方真实评分公式。** 官方仅给单调性和端点，不公开完整映射。31天原始总分与30天等效分分别列出。
+
+## 防止数据泄漏
+
+1. 不打乱时间；验证严格晚于训练，每月重训。
+2. validate_no_leakage()检查唯一递增连续日期、无重叠、历史不越过八月底；传入特征时逐值核对合法lag/rolling。
+3. 目标、行为和利率均滞后；imputer/scaler仅fit训练集。
+4. 特征集合预先声明，相关性只在所选训练截止日前分析。
+5. 参数和融合只用六月七月；八月仅评估；九月样例隔离。
+6. 递归函数只接收历史及未来日期，结束后才计算真实误差。
+7. 上日报价与起点固定外生量是保守假设，仍无法证明原始报价没有事后修订。
+8. 静态画像缺少生效时间，假定历史可得；检查器不能证明未知的数据源属性。
+
+## 实验结果
+
+八月独立检验：
+
+|模型|Purchase MAPE|Redeem MAPE|Weighted Error|
 |---|---:|---:|---:|
-| 2014-04 | 4.2028 | **4.5743** | 3.6449 |
-| 2014-05 | 5.1299 | 5.1833 | **5.2816** |
-| 2014-06 | 3.8982 | 3.8274 | **3.9101** |
-| 2014-07 | 4.9804 | **4.9940** | 4.5841 |
-| 2014-08 | 4.5807 | 4.9075 | **4.9732** |
-| **五个月整体** | **4.5650** | **4.7038** | **4.4879** |
+|冻结融合|14.59%|16.96%|15.89%|
+|随机森林|14.55%|16.27%|15.50%|
+|扩展随机森林|14.66%|16.45%|15.65%|
+|Weekly|25.12%|24.41%|24.73%|
 
-默认策略只对赎回进行 50% 周期融合，五个月整体比纯模型提高约 3.0%；申购保持纯模型，避免周期均值拉低波动月份。周期融合并非每个月都占优，但整体最好；固定月末倍率整体低于纯模型，因此只作为实验策略保留。
+冻结融合申购MAE约39,016,630，赎回MAE约45,094,130，金额单位与原始数据一致。精确MAE/RMSE见holdout_comparison.csv。31天加权模拟分158.24，30天等效模拟分153.14。
 
-### 本轮按序优化结论
+开发期融合加权误差19.61%，最佳单模型22.45%；八月融合略逊于单独随机森林，不能声称融合稳定更好。保留开发期方案，避免拿八月重新调权重。详见 [实验分析](output/experiment_report.md) 与 model_comparison.csv、metrics.csv。
 
-| 步骤 | 五个月滚动回测结论 | 默认采用 |
-|---|---|---|
-| 细化节假日、调休和工作日位置 | 相比旧日历特征有效 | 是 |
-| 新增4/8/12周同星期均值、中位数、标准差 | 共线和过拟合，整体降分 | 否，仅保留供分析 |
-| 用户人数、大额交易、渠道占比历史聚合 | 当前样本量下整体降分 | 否，仅保留供分析 |
-| 预测相对星期基线的残差 | 4月明显失稳，整体约3.15 | 否，保留 `--target-mode residual` 实验入口 |
-| Ridge / LightGBM / XGBoost 对比 | Ridge约2.98；默认LightGBM约4.65；浅层XGBoost更稳 | 选择浅层XGBoost |
-| 目标分别融合 | 申购不融合，赎回50%模型+50%周期锚点整体最好 | 是 |
+## 最终预测结果
 
-以上数值均为项目自定义线性近似评分，不是天池官方成绩。
+- output/prediction_201409.csv：恰好30天。
+- 申购：50% SameWeekday + 50% RandomForest_enriched。
+- 赎回：20% SameWeekday + 80% RandomForest_enriched。
+- 模型用截至八月底历史重训，权重来自六月七月。
+- 最终基础模型原始负预测均为0，无NaN/inf。
+- 九月无标签，不报告九月真实MAPE、官方积分或未经验证的置信区间。
 
-## 十一、自动调参与批量记录
+## 测试
 
-自动调参使用与正式流程一致的无泄露扩展窗口递归回测。模型参数采用可复现的随机搜索；同一批模型预测会复用到多组平滑权重和星期周期融合权重中，减少重复训练。
+~~~bash
+python -m unittest discover -s tests -v
+python tests/check_web.py
+~~~
 
-先查看默认快速档的测试规模，不执行训练：
+测试覆盖聚合、余额异常、lag、rolling、训练/推理特征一致、未来扰动不改变过去特征、重叠/九月/日期缺口拒绝、30天预测、非负和负值计数、零值指标、独立目标融合。另检验真实聚合与原始数据一致，以及十页Web与实际训练按钮。
 
-```bash
-python -m src.auto_tune --dry-run
-```
+## 项目答辩支持
 
-快速筛选默认测试8组XGBoost模型参数、2014年7—8月以及192个完整候选组合：
+1. 为什么是时间序列？每天目标存在趋势、周期和相邻日依赖。
+2. 为什么不能随机划分？未来阶段会进入训练，破坏真实预测起点。
+3. 为什么lag？表达过去水平、周周期和跨目标关联。
+4. 为什么rolling先shift？否则包含正在预测的当天真值。
+5. 为什么重点Redeem？题目赋予55%权重，独立优化并按加权误差比较。
+6. 为什么Walk-Forward？检查不同月份与资金规模变化下的稳定性。
+7. 为什么当前模型？依据六月七月选型，有记录，八月独立检查不足。
+8. 如何避免泄漏？输入边界、移位、训练期拟合、选择期隔离及对抗测试。
+9. 未来lag来自哪里？历史加已预测值，逐日递归，两目标同步。
+10. 有何不足？历史短、增长趋势、递归误差、未知外生量和画像时间戳缺失。
+11. 更多数据如何改进？多年份、真实节假日、直接多步、分群预测、嵌套验证、预测区间与业务损失。
 
-```bash
-python -m src.auto_tune
-```
+## 项目不足与改进方向
 
-大规模搜索默认测试30组模型参数、2014年4—8月以及2160个完整候选组合：
+427天不足以可靠学习年度季节性。总申购含收益限制行为解释；未来利率固定可能错过市场变化；静态画像缺生效时间。后续可引入更多历史、核实的节假日及报价发布时间，用新的未参与选型的留出期评价改进。不能反复优化八月后仍称其独立检验。
 
-```bash
-python -m src.auto_tune --profile large
-```
+## 阶段验收
 
-同时比较XGBoost和LightGBM：
+Phase 1目录/PDF；2质量审计；3余额与聚合；4真实EDA；5因果特征；6基线；7回归与时序模型；8三折回测；9对比；10赎回平滑参数及独立权重；11融合；12最终预测；13十页Web；14测试、说明和脚本。实际结果和运行日志在output。
 
-```bash
-python -m src.auto_tune --profile large --models both
-```
+## 本轮峰谷优化实验（2026-09-07）
 
-自定义搜索规模和后处理参数：
+新增 src/peak_models.py、src/optimize.py、src/optimization_ui.py 与 tests/test_optimization.py。
+仅用五月、六月、七月验证43个候选（每候选独立拟合两目标），先冻结参数/权重，再审计八月。
+优化后的申购/赎回峰值日平均误差分别从19.93%/23.16%降到15.94%/16.40%，但整体加权误差从15.89%升到16.49%，模拟分从158.24降到156.10。
+这次实验未通过默认提交替换验收，原 prediction_201409.csv 保持不变；优化文件仅作为实验候选提供。
 
-```bash
-python -m src.auto_tune --trials 20 --months 2014-04 2014-05 2014-06 2014-07 2014-08 --smooth-weights 0.97,0.99,1.0 --purchase-weights 0.95,1.0 --redeem-weights 0.35,0.5,0.65,0.8 --n-seeds 1
-```
+完整说明：[峰谷优化报告](output/optimization/optimization_report.md)。
+前端新增“峰谷优化”页，“未来预测”页可切换原版与实验候选；未通过验收时会明确提示。
+八月已经在上一轮观察，本轮称事后审计，不宣称完全未接触的测试集；本轮参数选择函数明确拒绝八月标签。
 
-结果会在每完成一组模型参数后立即写入，程序中断后执行同一命令会自动跳过已完成组合。只有明确希望清空同名结果重新计算时才加入 `--no-resume`。
+~~~bash
+python -m src.optimize --stage develop
+python -m src.optimize --stage audit
+~~~
 
-输出文件位于 `output/tuning/`：
+开发期搜索记录、冻结方案、指定日期误差、提交验收记录均在 output/optimization/。
+保存的独立目标模型在 models/optimization/。此实验不修改默认训练/预测流程，也未向平台提交文件。
 
-| 文件 | 内容 |
-|---|---|
-| `auto_tune_results.csv` | 每个完整参数组合的整体分数、MAPE、最差月份、月份间标准差、零分日和耗时 |
-| `auto_tune_fold_metrics.csv` | 每个候选在各回测月份的详细指标及早停轮数 |
-| `auto_tune_best.json` | 当前总分最高参数，便于复制到前端正式评估做3种子复核 |
-| `auto_tune_failures.csv` | 失败配置和异常信息；只有出现失败时生成 |
+## 真实多步样本验证实验
 
-建议先用单种子大规模筛选，再把排名靠前且最差月份表现稳定的参数复制到网页“正式滚动评估”，改为3个随机种子复核并下载提交文件。不要仅按8月单月最高分选择参数。
+新增多步样本账本、每次fit成员收据、真实树分裂特征统计、13项对照及样本组剔除。
+开发样本池包含4,036行、137个历史起点、305个不同标签日期；扩展行数不等于独立真实天数。
+每行记录 origin、horizon、label_date、feature_observed_max_date、输入特征、标签缩放与原始金额还原所需信息。
+每次训练都保存真正传入fit的样本ID、权重、矩阵摘要、模型列数和迭代数。
 
-也可以直接读取当前最佳参数JSON，在完整五个月上进行3种子复核；该模式只训练一个模型参数配置，并默认复用JSON中的平滑和融合权重：
+本轮样本组剔除发现：申购的31—90天前起点样本、较早样本及部分近期样本有开发期收益证据；赎回月末起点样本也有收益证据。
+具体数值、反例与真实样本ID见 [样本实验报告](output/multistep/sample_experiment_report.md)。
+这是样本组的消融证据，不证明组中每条记录具有因果贡献。
+每次试验使用相同五月/六月/七月边界；月末加权对照已修正为只改变权重，并经测试确认样本集合相同。
 
-```bash
-python -m src.auto_tune --profile large --params-json output/tuning/auto_tune_best.json --n-seeds 3 --output-dir output/tuning_confirm
-```
+冻结后的八月审计：申购MAPE16.69%，赎回MAPE21.40%，加权误差19.28%，模拟分131.50，未优于原默认方案。
+因此默认CSV不变；output/multistep/prediction_201409_multistep.csv仅为研究候选。
+samples/仅用于开发期；final_training_samples/单独保存截至八月底重训样本，不能混用于开发期选择。
+
+~~~bash
+python -m src.sample_experiment --stage develop
+python -m src.sample_experiment --stage audit
+python -m src.sample_report
+python -m unittest discover -s tests -v
+~~~
+
+前端新增“多步样本验证”页；“未来预测”页可以查看单独的多步研究候选，并显示验收状态。

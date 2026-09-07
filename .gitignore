@@ -49,3 +49,6 @@ mem-bank/
 # Plan and thread artifacts (auto-generated)
 plan/
 *.plan.md
+
+data/raw/
+data/processed/

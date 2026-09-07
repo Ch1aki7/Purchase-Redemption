@@ -1,89 +1,22 @@
-"""Leakage-safe historical features derived from daily user behavior aggregates."""
-
-import numpy as np
+"""日级行为与有限维度静态画像聚合。"""
 import pandas as pd
 
-
-BEHAVIOR_BASE_COLUMNS = (
-    "user_count",
-    "transacting_user_count",
-    "purchase_user_count",
-    "redeem_user_count",
-    "both_user_count",
-    "large_purchase_user_count",
-    "large_redeem_user_count",
-    "large_purchase_amt",
-    "large_redeem_amt",
-    "very_large_purchase_amt",
-    "very_large_redeem_amt",
-    "purchase_bank_share",
-    "transfer_redeem_share",
-)
-
-
-# 当日资金流组成与人均指标只能作为结构模型目标或展示字段，
-# 不得直接输入预测当天的机器学习模型，也无需批量生成未采用的行为特征。
-STRUCTURAL_TARGET_COLUMNS = (
-    "consume_amt",
-    "transfer_amt",
-    "large_user_purchase",
-    "small_user_purchase",
-    "large_user_redeem",
-    "small_user_redeem",
-    "large_active_user_count",
-    "small_active_user_count",
-    "purchase_per_active_user",
-    "redeem_per_active_user",
-    "consume_per_active_user",
-    "transfer_per_active_user",
-    "large_purchase_per_active_user",
-    "small_purchase_per_active_user",
-    "large_redeem_per_active_user",
-    "small_redeem_per_active_user",
-)
-
-
-def add_behavior_history_features(df):
-    """Create features that only use observations strictly before each row."""
-    df = df.sort_values("date").copy()
-    for column in BEHAVIOR_BASE_COLUMNS:
-        if column not in df.columns:
-            continue
-        shifted = df[column].shift(1)
-        for window in (7, 30):
-            df[f"behavior_{column}_roll_mean_{window}"] = shifted.rolling(window).mean()
-        weekday_lags = [df[column].shift(7 * week) for week in range(1, 13)]
-        df[f"behavior_{column}_weekday_mean_4w"] = pd.concat(
-            weekday_lags[:4], axis=1
-        ).mean(axis=1)
-        df[f"behavior_{column}_weekday_mean_12w"] = pd.concat(
-            weekday_lags, axis=1
-        ).mean(axis=1)
-    return df
-
-
-def behavior_feature_dict(date, history):
-    """Build future behavior features from pre-forecast aggregate history."""
-    date = pd.Timestamp(date)
-    features = {}
-    for column in BEHAVIOR_BASE_COLUMNS:
-        if column not in history.columns:
-            continue
-        values = history[column].dropna()
-        if values.empty:
-            continue
-        for window in (7, 30):
-            features[f"behavior_{column}_roll_mean_{window}"] = float(
-                values.tail(window).mean()
-            )
-        same_weekday = history.loc[
-            history["date"].dt.dayofweek == date.dayofweek, column
-        ].dropna()
-        fallback = float(values.tail(30).mean())
-        features[f"behavior_{column}_weekday_mean_4w"] = float(
-            same_weekday.tail(4).mean()
-        ) if not same_weekday.empty else fallback
-        features[f"behavior_{column}_weekday_mean_12w"] = float(
-            same_weekday.tail(12).mean()
-        ) if not same_weekday.empty else fallback
-    return features
+def aggregate_behavior(balance, profile):
+    """聚合原始金额，不删除异常；画像只用已有性别，避免全样本筛城市。"""
+    b = balance.copy()
+    b['has_purchase'] = b.purchase > 0
+    b['has_redeem'] = b.redeem > 0
+    b['active'] = b.has_purchase | b.has_redeem
+    b['is_new_observed'] = b.date.eq(b.groupby('user_id').date.transform('min'))
+    d = b.groupby('date').agg(total_purchase=('purchase','sum'), total_redeem=('redeem','sum'), daily_user_count=('user_id','nunique'), purchase_user_count=('has_purchase','sum'), redeem_user_count=('has_redeem','sum'), daily_active_users=('active','sum'), total_balance=('balance','sum'), avg_balance=('balance','mean'), median_balance=('balance','median'), new_observed_user_ratio=('is_new_observed','mean'))
+    d['net_flow'] = d.total_purchase-d.total_redeem
+    d['avg_purchase'] = d.total_purchase/d.daily_user_count
+    d['avg_redeem'] = d.total_redeem/d.daily_user_count
+    d['purchase_user_ratio'] = d.purchase_user_count/d.daily_user_count
+    d['redeem_user_ratio'] = d.redeem_user_count/d.daily_user_count
+    d['purchase_redeem_ratio'] = d.total_purchase/d.total_redeem.clip(lower=1)
+    if 'sex' in profile:
+        merged = b.loc[b.active,['user_id','date']].merge(profile[['user_id','sex']], on='user_id', how='left', validate='many_to_one')
+        merged['sex_1'] = merged.sex.eq(1).where(merged.sex.notna())
+        d['active_sex_1_ratio'] = merged.groupby('date').sex_1.mean()
+    return d.sort_index()

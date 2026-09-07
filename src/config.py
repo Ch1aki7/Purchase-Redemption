@@ -1,43 +1,17 @@
+"""统一路径、时间范围和实验参数。"""
 from pathlib import Path
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT_DIR / "Purchase Redemption Data"
-OUTPUT_DIR = ROOT_DIR / "output"
-MODEL_DIR = ROOT_DIR / "models"
-
-OUTPUT_DIR.mkdir(exist_ok=True)
-MODEL_DIR.mkdir(exist_ok=True)
-
-DAILY_FEATURES_PATH = OUTPUT_DIR / "daily_features.csv"
-DATA_QUALITY_REPORT_PATH = OUTPUT_DIR / "data_quality_report.csv"
-VALIDATION_PRED_PATH = OUTPUT_DIR / "validation_prediction.csv"
-BACKTEST_PRED_PATH = OUTPUT_DIR / "rolling_backtest_predictions.csv"
-BACKTEST_METRICS_PATH = OUTPUT_DIR / "rolling_backtest_metrics.csv"
-SUBMISSION_PATH = OUTPUT_DIR / "tc_comp_predict_table.csv"
-SUBMISSION_WITH_HEADER_PATH = OUTPUT_DIR / "tc_comp_predict_table_with_header.csv"
-STRUCTURAL_BACKTEST_PRED_PATH = OUTPUT_DIR / "structural_backtest_predictions.csv"
-STRUCTURAL_BACKTEST_METRICS_PATH = OUTPUT_DIR / "structural_backtest_metrics.csv"
-STRUCTURAL_VALIDATION_PATH = OUTPUT_DIR / "structural_validation_prediction.csv"
-STRUCTURAL_SUBMISSION_PATH = OUTPUT_DIR / "tc_comp_predict_table_structural.csv"
-STRUCTURAL_SUBMISSION_WITH_HEADER_PATH = OUTPUT_DIR / "tc_comp_predict_table_structural_with_header.csv"
-FEATURE_COLUMNS_PATH = MODEL_DIR / "feature_columns.json"
-MODEL_PURCHASE_PATH = MODEL_DIR / "model_purchase.pkl"
-MODEL_REDEEM_PATH = MODEL_DIR / "model_redeem.pkl"
-
-# 多月份滚动回测选出的默认周期融合参数。
-SEASONAL_WEEKDAY_LOOKBACK = 12
-PURCHASE_MODEL_WEIGHT = 1.0
-REDEEM_MODEL_WEIGHT = 0.5
-DEFAULT_MODEL_NAME = "xgboost"
-DEFAULT_MODEL_PRESET = "shallow"
-DEFAULT_N_SEEDS = 3
-DEFAULT_XGBOOST_PARAMS = {
-    "n_estimators": 2000,
-    "learning_rate": 0.02,
-    "max_depth": 2,
-    "min_child_weight": 8,
-    "subsample": 0.85,
-    "colsample_bytree": 0.85,
-    "reg_alpha": 0.1,
-    "reg_lambda": 2.0,
-}
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / 'data'
+RAW_DATA_DIR = DATA_DIR / 'raw'
+PROCESSED_DATA_DIR = DATA_DIR / 'processed'
+MODEL_DIR = ROOT / 'models'
+OUTPUT_DIR = ROOT / 'output'
+TRAIN_START, TRAIN_END = '2013-07-01', '2014-08-31'
+FORECAST_START, FORECAST_END = '2014-09-01', '2014-09-30'
+RANDOM_STATE = 42
+LAG_FEATURES = (1, 2, 3, 7, 14, 21, 28, 30)
+ROLLING_WINDOWS = (3, 7, 14, 30)
+PURCHASE_WEIGHT, REDEEM_WEIGHT = .45, .55
+TARGETS = ('purchase', 'redeem')
+EPSILON = 1.0  # 原始金额单位；零值另行报告，MAPE 使用这个下限
+FOLDS = (('2014-06-01','2014-06-30'), ('2014-07-01','2014-07-31'), ('2014-08-01','2014-08-31'))
