@@ -4,7 +4,7 @@
 
 依据《大数据技术项目实训》指导书项目二，使用余额宝用户交易、用户画像、收益率及SHIBOR预测平台每日资金流，支持流动性、现金储备与资金配置分析。历史2013-07-01至2014-08-31，预测2014-09-01至09-30。
 
-已实际运行数据审计、特征工程、13种候选方案三折回测、独立目标训练、融合和30天预测，提供十页Streamlit系统。九月没有真实标签，因此没有九月真实误差或官方得分。
+已实际运行数据审计、特征工程、13种候选方案三折回测、独立目标训练、融合和30天预测，提供八页Streamlit系统。九月没有真实标签，因此没有九月真实误差或官方得分。
 
 ## 数据说明
 
@@ -26,14 +26,12 @@
 
 ~~~text
 Purchase-Redemption/
-├── app.py                         # 十页Web
+├── app.py                         # 八页Web
 ├── run_all.py                     # 一键流水线
 ├── start_web.bat                  # Windows启动
 ├── requirements.txt
 ├── requirements-tested.txt       # 实际验证版本
 ├── README.md
-├── inspect_data.py
-├── build_reports.py
 ├── data/
 │   ├── raw/                      # 五个CSV的原始副本
 │   └── processed/
@@ -77,6 +75,9 @@ Purchase-Redemption/
 │   ├── ensemble.py
 │   ├── train.py
 │   ├── predict.py
+│   ├── c3_full_pipeline.py       # 正式模型编排与当前数据适配
+│   ├── event_distance.py         # 输出校验与目标隔离
+│   ├── formal_model_core/        # 已迁入当前分支的正式模型核心
 │   └── utils.py
 └── tests/
     ├── test_pipeline.py
@@ -233,7 +234,7 @@ python -m unittest discover -s tests -v
 python tests/check_web.py
 ~~~
 
-测试覆盖聚合、余额异常、lag、rolling、训练/推理特征一致、未来扰动不改变过去特征、重叠/九月/日期缺口拒绝、30天预测、非负和负值计数、零值指标、独立目标融合。另检验真实聚合与原始数据一致，以及十页Web与实际训练按钮。
+测试覆盖聚合、余额异常、lag、rolling、训练/推理特征一致、未来扰动不改变过去特征、重叠/九月/日期缺口拒绝、30天预测、非负和负值计数、零值指标、独立目标融合。另检验真实聚合与原始数据一致，以及八页Web与实际训练按钮。
 
 ## 项目答辩支持
 
@@ -255,48 +256,4 @@ python tests/check_web.py
 
 ## 阶段验收
 
-Phase 1目录/PDF；2质量审计；3余额与聚合；4真实EDA；5因果特征；6基线；7回归与时序模型；8三折回测；9对比；10赎回平滑参数及独立权重；11融合；12最终预测；13十页Web；14测试、说明和脚本。实际结果和运行日志在output。
-
-## 本轮峰谷优化实验（2026-09-07）
-
-新增 src/peak_models.py、src/optimize.py、src/optimization_ui.py 与 tests/test_optimization.py。
-仅用五月、六月、七月验证43个候选（每候选独立拟合两目标），先冻结参数/权重，再审计八月。
-优化后的申购/赎回峰值日平均误差分别从19.93%/23.16%降到15.94%/16.40%，但整体加权误差从15.89%升到16.49%，模拟分从158.24降到156.10。
-这次实验未通过默认提交替换验收，原 prediction_201409.csv 保持不变；优化文件仅作为实验候选提供。
-
-完整说明：[峰谷优化报告](output/optimization/optimization_report.md)。
-前端新增“峰谷优化”页，“未来预测”页可切换原版与实验候选；未通过验收时会明确提示。
-八月已经在上一轮观察，本轮称事后审计，不宣称完全未接触的测试集；本轮参数选择函数明确拒绝八月标签。
-
-~~~bash
-python -m src.optimize --stage develop
-python -m src.optimize --stage audit
-~~~
-
-开发期搜索记录、冻结方案、指定日期误差、提交验收记录均在 output/optimization/。
-保存的独立目标模型在 models/optimization/。此实验不修改默认训练/预测流程，也未向平台提交文件。
-
-## 真实多步样本验证实验
-
-新增多步样本账本、每次fit成员收据、真实树分裂特征统计、13项对照及样本组剔除。
-开发样本池包含4,036行、137个历史起点、305个不同标签日期；扩展行数不等于独立真实天数。
-每行记录 origin、horizon、label_date、feature_observed_max_date、输入特征、标签缩放与原始金额还原所需信息。
-每次训练都保存真正传入fit的样本ID、权重、矩阵摘要、模型列数和迭代数。
-
-本轮样本组剔除发现：申购的31—90天前起点样本、较早样本及部分近期样本有开发期收益证据；赎回月末起点样本也有收益证据。
-具体数值、反例与真实样本ID见 [样本实验报告](output/multistep/sample_experiment_report.md)。
-这是样本组的消融证据，不证明组中每条记录具有因果贡献。
-每次试验使用相同五月/六月/七月边界；月末加权对照已修正为只改变权重，并经测试确认样本集合相同。
-
-冻结后的八月审计：申购MAPE16.69%，赎回MAPE21.40%，加权误差19.28%，模拟分131.50，未优于原默认方案。
-因此默认CSV不变；output/multistep/prediction_201409_multistep.csv仅为研究候选。
-samples/仅用于开发期；final_training_samples/单独保存截至八月底重训样本，不能混用于开发期选择。
-
-~~~bash
-python -m src.sample_experiment --stage develop
-python -m src.sample_experiment --stage audit
-python -m src.sample_report
-python -m unittest discover -s tests -v
-~~~
-
-前端新增“多步样本验证”页；“未来预测”页可以查看单独的多步研究候选，并显示验收状态。
+Phase 1目录/PDF；2质量审计；3余额与聚合；4真实EDA；5因果特征；6基线；7回归与时序模型；8三折回测；9对比；10赎回平滑参数及独立权重；11融合；12最终预测；13八页Web；14测试、说明和脚本。实际结果和运行日志在output。

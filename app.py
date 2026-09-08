@@ -4,7 +4,11 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import streamlit as st
-from src.config import PROCESSED_DATA_DIR, OUTPUT_DIR, MODEL_DIR, TARGETS, FOLDS
+from src.config import (
+    PROCESSED_DATA_DIR, OUTPUT_DIR, MODEL_DIR, TARGETS, FOLDS,
+    EVENT_DISTANCE_MANIFEST_PATH, EVENT_DISTANCE_PURCHASE_ONLY_PATH,
+    EVENT_DISTANCE_REDEEM_ONLY_PATH, C3_EVENT_DISTANCE_VALIDATION_PATH,
+)
 from src.eda import eda_figures,error_insights
 from src.feature_engineering import make_features
 from src.models import fit_model,BASELINES,feature_importance
@@ -18,6 +22,11 @@ st.markdown('''<style>.block-container{padding-top:2rem;max-width:1450px} [data-
 def read_csv(path,mtime):
     """按文件更新时间失效，避免重跑后显示旧实验结果。"""
     return pd.read_csv(path)
+
+@st.cache_data
+def read_submission(path,mtime):
+    """读取竞赛要求的无表头三列表，mtime 用于训练后自动刷新。"""
+    return pd.read_csv(path,header=None,names=['date','purchase','redeem'])
 
 def table(name,processed=False):
     """从预计算结果读取表；缺文件给出可执行指引。"""
@@ -42,8 +51,27 @@ def metrics_cards(m):
     for c,label,value in zip(cols,['申购 MAPE','赎回 MAPE','加权相对误差','30天等效模拟分'],[f"{m['Purchase_MAPE']:.2f}%",f"{m['Redeem_MAPE']:.2f}%",f"{m['Weighted_Error']:.2%}",f"{m['Simulated_Score_30day_equivalent']:.2f}"]):
         c.metric(label,value)
 
+def flatten_counts(mapping,prefix=()):
+    """将嵌套计数字典整理为适合前端展示的行。"""
+    rows=[]
+    for key,value in mapping.items():
+        path=(*prefix,str(key))
+        if isinstance(value,dict):
+            rows.extend(flatten_counts(value,path))
+        else:
+            rows.append({'项目':' / '.join(path),'数量':value})
+    return rows
+
+def weight_table(weights):
+    """将按目标保存的融合权重转成长表。"""
+    labels={'purchase':'申购','redeem':'赎回'}
+    return pd.DataFrame([
+        {'目标':labels.get(target,target),'模型':model,'权重':weight}
+        for target,models in weights.items() for model,weight in models.items()
+    ])
+
 st.sidebar.title('资金流预测 · 分析台')
-page=st.sidebar.radio('功能导航',['首页 / 项目概览','数据探索','特征分析','模型训练','模型评估','滚动回测','未来预测','误差分析','峰谷优化','多步样本验证'])
+page=st.sidebar.radio('功能导航',['首页 / 项目概览','数据探索','特征分析','模型训练','模型评估','滚动回测','未来预测','误差分析'])
 st.sidebar.caption('历史：2013.07.01 — 2014.08.31\n\n目标：2014.09.01 — 2014.09.30')
 st.sidebar.info('所有金额保留原始数据单位。指导书未说明单位换算，系统不擅自换算为元。')
 d=table('daily_balance.csv',True); d['date']=pd.to_datetime(d.date); d=d.set_index('date')
@@ -83,23 +111,91 @@ elif page=='数据探索':
         report=json.loads((OUTPUT_DIR/'data_quality_report.json').read_text(encoding='utf8'))
         key=st.selectbox('原始数据表',list(report))
         r=report[key]
-        st.write('文件',r['file'],'shape',r['shape']);st.json(r.get('mapping',{'说明':r.get('role')}))
+        shape=r.get('shape',['—','—'])
+        quality_cards=st.columns(4)
+        quality_cards[0].metric('文件',r['file'])
+        quality_cards[1].metric('行数',f'{shape[0]:,}' if isinstance(shape[0],int) else shape[0])
+        quality_cards[2].metric('列数',shape[1])
+        quality_cards[3].metric('完全重复行',f"{r.get('duplicates',0):,}")
+        if r.get('date_range'):
+            st.caption(f"日期范围：{r['date_range'][0][:10]} — {r['date_range'][1][:10]}")
+        mapping=r.get('mapping')
+        if mapping:
+            st.markdown('#### 字段标准化映射')
+            st.dataframe(pd.DataFrame([
+                {'原始字段':source,'标准字段':target} for source,target in mapping.items()
+            ]),hide_index=True,width='stretch')
+        elif r.get('role'):
+            st.info(r['role'])
         if 'missing_rate' in r:
             chart(px.bar(x=list(r['missing_rate']),y=list(r['missing_rate'].values()),labels={'x':'字段','y':'缺失比例'}))
-            st.write('完全重复行',r['duplicates'],'日期范围',r.get('date_range','静态用户表'))
             with st.expander('字段类型、前五行及基础统计'):
-                st.json(r['dtypes']);st.dataframe(pd.DataFrame(r['head']));st.json(r['statistics'])
+                st.markdown('**字段类型**')
+                st.dataframe(pd.DataFrame([
+                    {'字段':field,'数据类型':dtype} for field,dtype in r['dtypes'].items()
+                ]),hide_index=True,width='stretch')
+                st.markdown('**前五行**')
+                st.dataframe(pd.DataFrame(r['head']),hide_index=True,width='stretch')
+                st.markdown('**基础统计**')
+                statistics=pd.DataFrame.from_dict(r['statistics'],orient='index').replace('NaN',np.nan)
+                statistics.index.name='字段'
+                st.dataframe(statistics.reset_index(),hide_index=True,width='stretch')
         st.dataframe(table('validation_report.csv',True),hide_index=True)
         st.subheader('余额一致性')
-        st.json(json.loads((OUTPUT_DIR/'balance_consistency.json').read_text(encoding='utf8')))
+        consistency=json.loads((OUTPUT_DIR/'balance_consistency.json').read_text(encoding='utf8'))
+        check_labels={
+            'balance_error':'当日余额等式',
+            'previous_record_error':'上一条记录余额等式',
+            'previous_balance_link_error':'相邻记录余额衔接',
+        }
+        consistency_rows=[]
+        for check_key,label in check_labels.items():
+            values=consistency[check_key]
+            consistency_rows.append({
+                '检查项目':label,
+                '检查记录数':f"{values['checked']:,}",
+                '异常数':f"{values['anomalies']:,}",
+                '异常率':f"{values['ratio']:.8%}",
+                '最大绝对误差':f"{values['max_absolute_error']:,.2f}",
+            })
+        st.dataframe(pd.DataFrame(consistency_rows),hide_index=True,width='stretch')
+        st.metric('首次出现或日期不连续记录',f"{consistency['nonconsecutive_or_first_records']:,}")
+        component_labels={
+            'purchase_components':'申购组成项',
+            'direct_components':'直接申购组成项',
+            'redeem_components':'赎回组成项',
+            'transfer_components':'转出组成项',
+        }
+        component_rows=[]
+        for component_key,label in component_labels.items():
+            values=consistency[component_key]
+            component_rows.append({
+                '组成项检查':label,
+                '异常数':f"{values['anomalies']:,}",
+                '最大绝对误差':f"{values['max_absolute_error']:,.2f}",
+            })
+        st.markdown('#### 金额组成项一致性')
+        st.dataframe(pd.DataFrame(component_rows),hide_index=True,width='stretch')
         st.dataframe(table('balance_anomaly_samples.csv'),hide_index=True)
         st.caption('总申购已包含收益；总赎回已包含消费与转出，不能重复加减。非连续用户观测单独统计，异常记录保留。')
         st.subheader('异常日期（全历史 IQR 描述性标记）')
         st.dataframe(subset.loc[subset.total_purchase_outlier|subset.total_redeem_outlier])
     with tabs[3]:
         dist=json.loads((OUTPUT_DIR/'user_distributions.json').read_text(encoding='utf8'))
-        attr=st.selectbox('用户属性',list(dist)); counts=pd.Series(dist[attr]).sort_values(ascending=False).head(20)
-        chart(px.bar(x=counts.index.astype(str),y=counts.values,labels={'x':attr,'y':'用户数'},title='用户分布（最多前20类）'))
+        attribute_labels={'sex':'性别编码','city':'城市编码','constellation':'星座'}
+        for attr,values in dist.items():
+            counts=pd.Series(values,dtype='int64').sort_values(ascending=False)
+            distribution=pd.DataFrame({
+                '属性取值':counts.index.astype(str),
+                '用户数':counts.values,
+                '占比':(counts.values/counts.sum()),
+            })
+            st.markdown(f"#### {attribute_labels.get(attr,attr)}分布")
+            chart(px.bar(
+                distribution,x='属性取值',y='用户数',text='用户数',
+                hover_data={'占比':':.2%'},
+                title=f"{attribute_labels.get(attr,attr)}用户分布",
+            ))
         st.caption('实际用户画像仅包含性别、城市和星座。未提供年龄、等级或注册日期，不虚构这些字段。首次观测不等于真实注册。')
 
 elif page=='特征分析':
@@ -164,6 +260,68 @@ elif page=='模型训练':
         chart(px.line(details,x=details.index,y=['actual_purchase','pred_purchase','actual_redeem','pred_redeem']))
         score_note()
 
+    st.divider()
+    st.subheader('正式模型')
+    st.write('正式模型依次执行五个月滚动回测、日历 Ridge、月度总量与日形状、事件距离全参数搜索，最后生成两个目标隔离提交。')
+    st.caption('参数空间固定：2014-04 至 2014-07 用于选型，2014-08 仅作独立门禁。完整训练耗时较长，不会覆盖原融合方案的 prediction_201409.csv。')
+    if st.button('运行正式模型并生成两个隔离 CSV',type='primary',key='run_event_distance'):
+        from src.c3_full_pipeline import run_full_pipeline
+        try:
+            with st.status('正在运行正式模型完整链路…',expanded=True) as event_status:
+                event_result=run_full_pipeline(d,callback=event_status.write)
+                event_status.update(label='正式模型完整链路已完成',state='complete',expanded=False)
+            st.session_state['event_distance_manifest']=event_result['manifest']
+            st.success('正式模型训练与目标隔离完成，两个 CSV 均已生成。')
+        except (FileNotFoundError,ValueError) as exc:
+            st.error(str(exc))
+    if EVENT_DISTANCE_PURCHASE_ONLY_PATH.exists() and EVENT_DISTANCE_REDEEM_ONLY_PATH.exists():
+        manifest=st.session_state.get('event_distance_manifest')
+        if manifest is None and EVENT_DISTANCE_MANIFEST_PATH.exists():
+            manifest=json.loads(EVENT_DISTANCE_MANIFEST_PATH.read_text(encoding='utf8'))
+        if manifest and 'event_distance_selected' in manifest:
+            selected=pd.DataFrame.from_dict(manifest['event_distance_selected'],orient='index')
+            selected.index.name='target'
+            show_cols=[c for c in ['ridge_weight','hw_weight','event_scale','tune_delta','winning_months','worst_month_delta','holdout_delta'] if c in selected]
+            st.dataframe(selected[show_cols].reset_index(),hide_index=True)
+            with st.expander('查看正式模型训练阶段'):
+                st.dataframe(pd.DataFrame({'阶段':[
+                    '滚动回测','日历模型选型','月度总量与日形状选型',
+                    '正式模型参数选型','目标隔离导出',
+                ]}),hide_index=True,width='stretch')
+        if C3_EVENT_DISTANCE_VALIDATION_PATH.exists():
+            validation=read_csv(str(C3_EVENT_DISTANCE_VALIDATION_PATH),C3_EVENT_DISTANCE_VALIDATION_PATH.stat().st_mtime_ns)
+            validation['date']=pd.to_datetime(validation['date'])
+            available_folds=validation['fold'].drop_duplicates().tolist()
+            selected_fold=st.selectbox(
+                '实际值与预测值对比月份',available_folds,
+                index=len(available_folds)-1,key='event_validation_fold',
+            )
+            validation_part=validation[validation['fold']==selected_fold].set_index('date')
+            fold_role='独立检验' if selected_fold=='2014-08' else '开发期回放'
+            st.caption(f'{selected_fold} · {fold_role}；九月没有真实标签，因此不绘制虚构的九月实际值。')
+            event_chart_data=validation_part.reset_index().melt(
+                id_vars='date',value_vars=['actual_purchase','pred_purchase'],
+                var_name='series',value_name='amount',
+            )
+            event_chart_data['series']=event_chart_data['series'].map({'actual_purchase':'实际申购','pred_purchase':'预测申购'})
+            chart(px.line(event_chart_data,x='date',y='amount',color='series',markers=True,title='申购：实际值 vs 正式模型预测值'))
+            event_chart_data=validation_part.reset_index().melt(
+                id_vars='date',value_vars=['actual_redeem','pred_redeem'],
+                var_name='series',value_name='amount',
+            )
+            event_chart_data['series']=event_chart_data['series'].map({'actual_redeem':'实际赎回','pred_redeem':'预测赎回'})
+            chart(px.line(event_chart_data,x='date',y='amount',color='series',markers=True,title='赎回：实际值 vs 正式模型预测值'))
+        event_tabs=st.tabs(['仅替换申购','仅替换赎回'])
+        for event_tab,event_path in zip(event_tabs,[EVENT_DISTANCE_PURCHASE_ONLY_PATH,EVENT_DISTANCE_REDEEM_ONLY_PATH]):
+            with event_tab:
+                event_frame=read_submission(str(event_path),event_path.stat().st_mtime_ns)
+                st.dataframe(event_frame,hide_index=True)
+                st.download_button(
+                    f'下载 {event_path.name}',event_path.read_bytes(),event_path.name,'text/csv',
+                    key=f'download_{event_path.stem}',
+                )
+        st.caption(f'输出目录：{OUTPUT_DIR}')
+
 elif page=='模型评估':
     tab=st.radio('评价数据',['八月独立检验','六月七月开发期'],horizontal=True)
     frame=table('holdout_comparison.csv' if tab=='八月独立检验' else 'model_comparison.csv')
@@ -183,24 +341,23 @@ elif page=='滚动回测':
     chart(px.line(part,x='Period',y='Redeem_MAPE',color='Model',markers=True))
     st.dataframe(part,hide_index=True);score_note()
     st.markdown('每月起点重新训练，整月递归预测；七月融合只用六月的误差，八月融合只用六月和七月的误差。六月融合没有既往折，预先使用 Weekly。')
-    st.json(json.loads((OUTPUT_DIR/'leakage_audit.json').read_text(encoding='utf8')))
+    audit=json.loads((OUTPUT_DIR/'leakage_audit.json').read_text(encoding='utf8'))
+    st.subheader('时序与数据泄漏审计')
+    audit_rows=[]
+    for fold,item in enumerate(audit,1):
+        audit_rows.append({
+            'Fold':fold,
+            '训练截止日':item['train_end'][:10],
+            '状态':'通过' if item['status']=='passed' else item['status'],
+            '检查项':'；'.join(item['checks']),
+        })
+    st.dataframe(pd.DataFrame(audit_rows),hide_index=True,width='stretch')
+    limitations=list(dict.fromkeys(item.get('limitations','') for item in audit if item.get('limitations')))
+    for limitation in limitations:
+        st.info(f'审计边界：{limitation}')
 
 elif page=='未来预测':
-    versions={'原融合方案':'prediction_201409.csv'}
-    if (OUTPUT_DIR/'optimization/prediction_201409_optimized.csv').exists():
-        versions['峰谷实验候选（已冻结）']='optimization/prediction_201409_optimized.csv'
-    if (OUTPUT_DIR/'multistep/prediction_201409_multistep.csv').exists():
-        versions['多步样本研究候选（已冻结）']='multistep/prediction_201409_multistep.csv'
-    version=st.radio('预测版本',list(versions),horizontal=True)
-    forecast_name=versions[version]
-    if forecast_name.startswith('optimization/'):
-        release_file=OUTPUT_DIR/'optimization/release_check.json'
-        if release_file.exists() and not json.loads(release_file.read_text(encoding='utf8'))['approved_for_default_submission']:
-            st.warning('当前显示峰谷实验候选：未通过整体误差改进验收，原默认提交未被替换。')
-    if forecast_name.startswith('multistep/'):
-        release=json.loads((OUTPUT_DIR/'multistep/release_check.json').read_text(encoding='utf8'))
-        if not release['passed']:
-            st.warning('当前显示多步样本研究候选：未通过整体改进验收，原默认提交未被替换。')
+    forecast_name='prediction_201409.csv'
     pred=table(forecast_name);pred['date']=pd.to_datetime(pred.date.astype(str),format='%Y%m%d')
     st.info('2014年9月1日—30日 · 无真实标签 · 输出四舍五入为整数；预测方式取决于所选方案')
     chart(px.line(pred,x='date',y=['purchase','redeem'],markers=True,title='未来30天申购与赎回预测'))
@@ -208,8 +365,23 @@ elif page=='未来预测':
     a,b=st.columns(2)
     a.download_button('Download CSV（含表头）',(OUTPUT_DIR/forecast_name).read_bytes(),forecast_name.split('/')[-1],'text/csv')
     b.download_button('下载无表头提交版',(OUTPUT_DIR/forecast_name.replace('.csv','_no_header.csv')).read_bytes(),forecast_name.split('/')[-1].replace('.csv','_no_header.csv'),'text/csv')
-    validation_path=(MODEL_DIR/'multistep/manifest.json') if forecast_name.startswith('multistep/') else ((MODEL_DIR/'optimization/manifest.json') if forecast_name.startswith('optimization/') else (OUTPUT_DIR/'prediction_validation.json'))
-    st.json(json.loads(validation_path.read_text(encoding='utf8')))
+    validation_path=OUTPUT_DIR/'prediction_validation.json'
+    validation=json.loads(validation_path.read_text(encoding='utf8'))
+    st.subheader('预测产物验证与模型来源')
+    cards=st.columns(4)
+    cards[0].metric('输出行数',validation.get('rows','—'))
+    cards[1].metric('有限数值','通过' if validation.get('finite') else '未通过')
+    cards[2].metric('非负检查','通过' if validation.get('nonnegative') else '未通过')
+    cards[3].metric('启用模型数',len(validation.get('negative_raw_predictions',{})))
+    if validation.get('weights'):
+        st.markdown('#### 冻结融合权重')
+        weights=weight_table(validation['weights'])
+        st.dataframe(weights.style.format({'权重':'{:.2%}'}),hide_index=True,width='stretch')
+    negative_rows=flatten_counts(validation.get('negative_raw_predictions',{}))
+    if negative_rows:
+        st.markdown('#### 原始负预测截断统计')
+        st.dataframe(pd.DataFrame(negative_rows),hide_index=True,width='stretch')
+    st.caption(f"来源：{validation.get('source','—')}")
 
 elif page=='误差分析':
     data=table('validation_predictions.csv');data['date']=pd.to_datetime(data.date)
@@ -232,13 +404,3 @@ elif page=='误差分析':
     for line in error_insights(e):st.write('• '+line)
     st.download_button('导出本组误差明细',e.to_csv().encode('utf-8-sig'),'error_analysis.csv','text/csv')
     score_note()
-
-
-elif page=='峰谷优化':
-    from src.optimization_ui import render_optimization_page
-    render_optimization_page(d)
-
-
-elif page=='多步样本验证':
-    from src.sample_ui import render_sample_page
-    render_sample_page()
