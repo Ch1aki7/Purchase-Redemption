@@ -20,9 +20,83 @@ from src.config import (
 )
 from src.evaluate import evaluate_prediction, mock_score_from_error, relative_error
 
-st.set_page_config(page_title="资金流入流出预测系统", layout="wide")
-st.title("资金流入流出预测系统")
-st.caption("数据探索、模型训练与评估、预测结果展示、误差分析")
+st.set_page_config(
+    page_title="FlowScope · 资金流动预测工作台",
+    page_icon="💹",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .stApp { background: #f6f8fb; color: #172033; }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+        border-right: 1px solid #dbe3ee;
+    }
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] p {
+        color: #172033;
+    }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+        color: #596780;
+    }
+    [data-testid="stSidebar"] hr { border-color: #dbe3ee; }
+    [data-testid="stSidebar"] [data-testid="stExpander"] {
+        background: #ffffff;
+        border: 1px solid #d7e0eb;
+        border-radius: 10px;
+    }
+    [data-testid="stSidebar"] [data-testid="stExpander"] summary,
+    [data-testid="stSidebar"] [data-testid="stExpander"] summary * {
+        color: #24324a;
+        font-weight: 600;
+    }
+    [data-testid="stSidebar"] .stButton button {
+        width: 100%;
+        color: #ffffff;
+        background: #0f766e;
+        border: 1px solid #0f766e;
+        font-weight: 650;
+    }
+    [data-testid="stSidebar"] .stButton button:hover {
+        color: #ffffff;
+        background: #115e59;
+        border-color: #115e59;
+    }
+    [data-testid="stSidebar"] [data-testid="stProgress"] > div > div > div {
+        background-color: #0f766e;
+    }
+    [data-testid="stSidebar"] [data-testid="stAlert"] p {
+        color: inherit;
+    }
+    .hero {
+        padding: 1.4rem 1.6rem; border-radius: 18px; color: white;
+        background: linear-gradient(120deg, #0f172a 0%, #123f62 55%, #0f766e 100%);
+        box-shadow: 0 12px 32px rgba(15, 23, 42, .16); margin-bottom: 1rem;
+    }
+    .hero h1 { margin: 0; font-size: 2rem; }
+    .hero p { margin: .45rem 0 0; color: #dbeafe; }
+    .section-note { color: #64748b; font-size: .92rem; margin-top: -.55rem; }
+    div[data-testid="stMetric"] {
+        background: white; border: 1px solid #e2e8f0; border-radius: 14px;
+        padding: .8rem 1rem; box-shadow: 0 4px 14px rgba(15, 23, 42, .05);
+    }
+    div[data-testid="stPlotlyChart"], div[data-testid="stDataFrame"] {
+        background: white; border-radius: 14px; padding: .25rem;
+    }
+    .status-dot { color: #34d399; font-size: .85rem; }
+    </style>
+    <div class="hero">
+      <h1>FlowScope 资金流动预测工作台</h1>
+      <p>从历史资金行为到未来流动性预警 · 申购与赎回一体化分析</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # =========================
@@ -33,6 +107,37 @@ def read_csv_if_exists(path: Path):
     if path.exists():
         return pd.read_csv(path)
     return None
+
+
+def format_amount(value) -> str:
+    """用适合业务阅读的单位展示大额资金。"""
+    value = float(value)
+    if abs(value) >= 1e8:
+        return f"{value / 1e8:.2f} 亿"
+    if abs(value) >= 1e4:
+        return f"{value / 1e4:.1f} 万"
+    return f"{value:,.0f}"
+
+
+def add_net_flow(df: pd.DataFrame, purchase_col="purchase", redeem_col="redeem") -> pd.DataFrame:
+    result = df.copy()
+    result["net_flow"] = result[purchase_col] - result[redeem_col]
+    result["flow_status"] = np.where(result["net_flow"] >= 0, "净流入", "净流出")
+    return result
+
+
+def base_figure(fig, height=390):
+    fig.update_layout(
+        height=height,
+        margin=dict(l=18, r=18, t=55, b=18),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        hovermode="x unified",
+        legend_title_text="",
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#e2e8f0")
+    return fig
 
 
 def find_data_file(keyword: str):
@@ -235,27 +340,33 @@ def get_display_validation(source_name: str):
 # 侧边栏：运行与结果选择
 # =========================
 with st.sidebar:
+    st.markdown("## 💹 FlowScope")
+    st.caption("资金预测与流动性决策平台")
+    artifact_checks = {
+        "特征数据": DAILY_FEATURES_PATH.exists(),
+        "验证结果": VALIDATION_PRED_PATH.exists(),
+        "未来预测": SUBMISSION_WITH_HEADER_PATH.exists(),
+    }
+    ready_count = sum(artifact_checks.values())
+    st.progress(ready_count / len(artifact_checks), text=f"系统就绪度 {ready_count}/{len(artifact_checks)}")
+    for label, ready in artifact_checks.items():
+        st.caption(f"{'●' if ready else '○'} {label} · {'已就绪' if ready else '待生成'}")
     st.divider()
     st.header("运行控制")
-    st.warning("一键运行完整流程会重新生成 output/ 下的特征、验证和预测文件，并覆盖 models/ 下的正式模型文件。")
+    st.info("一键运行会重新生成当前唯一的正式组合模型、匹配的8月验证结果和9月提交文件。")
     with st.expander("完整流程固定参数说明", expanded=False):
         st.markdown(
             """
-            **一键运行完整流程使用 `src/train.py` 和 `src/predict.py` 中的固定正式配置，\
-            不会读取下方交互训练区域的页面参数。**
+            **正式预测采用约 131 分提交所对应的组合结构。**
 
             - 训练数据：`2013-08-01` 至 `2014-07-31`
-            - 本地验证：`2014-08-01` 至 `2014-08-31`，采用逐日滚动预测
-            - 最终预测：`2014-09-01` 至 `2014-09-30`，逐日滚动预测并回填预测值
-            - 主模型：多种子 `LightGBM` 集成，申购和赎回分别训练
-            - 集成设置：`n_seeds=3`，随机种子为 `42、43、44`
-            - LightGBM 参数：`n_estimators=10000`，`learning_rate=0.001`，`num_leaves=31`，`max_depth=-1`
-            - 正则与采样：`min_child_samples=5`，`subsample=0.85`，`colsample_bytree=0.85`，`reg_alpha=0.05`，`reg_lambda=0.05`
-            - 目标变换：训练时使用 `log1p`，预测后使用 `expm1` 还原金额
-            - 平滑修正：`预测值 × 0.99 + 近7日均值 × 0.01`
-            - 月末后处理：月末最后3天申购 `×1.2`，赎回 `×1.3`
-            - 外部变量：8月验证使用7月均值，9月预测使用8月均值
-            - 输出文件：`output/daily_features.csv`、`output/data_quality_report.csv`、`output/validation_prediction.csv`、`output/tc_comp_predict_table.csv`、`models/*.pkl`
+            - 选参方式：4—7月多窗口滚动回测，8月作为独立门禁
+            - 申购结构：日历趋势基线 + 月度总量/日内形状分解
+            - 赎回结构：上述基线 + 节假日前后距离特征 + 周周期信号
+            - 组合策略：保留月度形状申购，仅替换经过线上验证有效的赎回预测
+            - 正式预测：`2014-09-01` 至 `2014-09-30`
+            - 输出文件：`output/validation_prediction.csv`、`output/tc_comp_predict_table.csv` 和带表头展示文件
+            - 说明：内部仍计算树模型滚动基线作为组合输入，但不再把旧模型作为前端结果展示
             """
         )
     if st.button("一键运行完整流程", type="secondary"):
@@ -276,30 +387,124 @@ with st.sidebar:
             st.code((result.stdout or "") + "\n" + (result.stderr or ""))
 
     st.divider()
-    st.header("展示结果来源")
-    source_options = ["主流程滚动预测结果"]
-    if "interactive_valid" in st.session_state:
-        source_options.append("本次交互训练结果")
-    result_source = st.radio("选择当前展示结果", source_options)
+    st.success("当前结果源：正式组合模型")
+    result_source = "正式组合模型"
 
 
 # =========================
 # 页面主体
 # =========================
-tab1, tab2, tab3, tab4 = st.tabs(["数据探索", "模型训练与评估", "预测结果展示", "误差分析"])
+tab0, tab1, tab2, tab3, tab4 = st.tabs(
+    ["📊 经营总览", "🔎 数据洞察", "🧠 模型与验证", "📅 预测与计划", "⚠️ 误差诊断"]
+)
+
+with tab0:
+    st.subheader("经营总览")
+    st.markdown('<p class="section-note">一屏查看历史资金盘面、未来预测和需要优先关注的日期。</p>', unsafe_allow_html=True)
+
+    history = read_csv_if_exists(DAILY_FEATURES_PATH)
+    forecast = read_csv_if_exists(SUBMISSION_WITH_HEADER_PATH)
+    validation = get_display_validation(result_source)
+
+    if history is None or forecast is None:
+        st.warning("总览所需数据尚未生成，请在左侧运行完整流程。")
+    else:
+        history["date"] = pd.to_datetime(history["date"])
+        forecast["date"] = pd.to_datetime(forecast["report_date"].astype(str))
+        forecast = add_net_flow(forecast)
+        latest_30 = history.sort_values("date").tail(30)
+
+        total_purchase = forecast["purchase"].sum()
+        total_redeem = forecast["redeem"].sum()
+        total_net = forecast["net_flow"].sum()
+        peak_redeem_row = forecast.loc[forecast["redeem"].idxmax()]
+        cols = st.columns(4)
+        cols[0].metric("9月预计申购", format_amount(total_purchase))
+        cols[1].metric("9月预计赎回", format_amount(total_redeem))
+        cols[2].metric("9月预计净流量", format_amount(total_net), "净流入" if total_net >= 0 else "净流出")
+        cols[3].metric("赎回峰值日", peak_redeem_row["date"].strftime("%m月%d日"), format_amount(peak_redeem_row["redeem"]))
+
+        left, right = st.columns([1.65, 1])
+        with left:
+            overview_plot = forecast[["date", "purchase", "redeem"]].melt(
+                "date", var_name="资金类型", value_name="金额"
+            )
+            fig = px.area(
+                overview_plot,
+                x="date",
+                y="金额",
+                color="资金类型",
+                title="未来 30 天资金流动预测",
+                color_discrete_map={"purchase": "#0f766e", "redeem": "#f97316"},
+            )
+            st.plotly_chart(base_figure(fig), use_container_width=True)
+        with right:
+            flow_fig = px.bar(
+                forecast,
+                x="date",
+                y="net_flow",
+                color="flow_status",
+                title="每日净流入 / 净流出",
+                color_discrete_map={"净流入": "#10b981", "净流出": "#ef4444"},
+            )
+            st.plotly_chart(base_figure(flow_fig), use_container_width=True)
+
+        st.markdown("### 流动性关注清单")
+        risk_threshold = float(latest_30["redeem"].quantile(0.75))
+        risks = forecast[forecast["redeem"] >= risk_threshold].copy()
+        risks["关注原因"] = "预计赎回高于近30日历史75分位"
+        risks["建议准备金"] = (risks["redeem"] * 1.1).round().astype("int64")
+        risks["日期"] = risks["date"].dt.strftime("%Y-%m-%d")
+        if risks.empty:
+            st.success("未来 30 天未发现高于近期阈值的赎回压力日。")
+        else:
+            st.dataframe(
+                risks[["日期", "purchase", "redeem", "net_flow", "建议准备金", "关注原因"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "purchase": st.column_config.NumberColumn("预计申购", format="%,d"),
+                    "redeem": st.column_config.NumberColumn("预计赎回", format="%,d"),
+                    "net_flow": st.column_config.NumberColumn("预计净流量", format="%,d"),
+                    "建议准备金": st.column_config.NumberColumn(format="%,d"),
+                },
+            )
+
+        if validation is not None:
+            metrics = evaluate_prediction(validation)
+            st.caption(
+                f"当前结果源：{result_source} · 内部模拟总分 {metrics['total_score']:.2f} · "
+                f"申购 MAPE {metrics['purchase_mape']:.1%} · 赎回 MAPE {metrics['redeem_mape']:.1%}。"
+                " 模拟分仅用于本地比较，并非官方成绩。"
+            )
 
 with tab1:
-    st.subheader("数据探索模块")
+    st.subheader("数据洞察")
+    st.markdown('<p class="section-note">按时间窗口探索资金趋势、周期规律与外部市场变量。</p>', unsafe_allow_html=True)
     df = read_csv_if_exists(DAILY_FEATURES_PATH)
     if df is None:
         st.warning("尚未生成 daily_features.csv，请先运行：python run_all.py")
     else:
         df["date"] = pd.to_datetime(df["date"])
-        c1, c2, c3 = st.columns(3)
-        c1.metric("日级样本数", len(df))
-        c2.metric("特征列数", len(df.columns))
-        c3.metric("日期范围", f"{df['date'].min().date()} ~ {df['date'].max().date()}")
-        st.dataframe(df.head(20), use_container_width=True)
+        min_date, max_date = df["date"].min().date(), df["date"].max().date()
+        selected_range = st.date_input(
+            "分析日期范围",
+            value=(max(min_date, (df["date"].max() - pd.Timedelta(days=120)).date()), max_date),
+            min_value=min_date,
+            max_value=max_date,
+        )
+        if len(selected_range) == 2:
+            start_date, end_date = selected_range
+            view_df = df[df["date"].between(pd.Timestamp(start_date), pd.Timestamp(end_date))].copy()
+        else:
+            view_df = df.copy()
+        view_df = add_net_flow(view_df)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("区间天数", len(view_df))
+        c2.metric("日均申购", format_amount(view_df["purchase"].mean()))
+        c3.metric("日均赎回", format_amount(view_df["redeem"].mean()))
+        c4.metric("累计净流量", format_amount(view_df["net_flow"].sum()))
 
         quality_report = read_csv_if_exists(DATA_QUALITY_REPORT_PATH)
         if quality_report is not None:
@@ -307,20 +512,43 @@ with tab1:
             st.caption("余额一致性校验：tBalance = yBalance + total_purchase_amt - total_redeem_amt")
             st.dataframe(quality_report, use_container_width=True)
 
-        fund_plot = df[["date", "purchase", "redeem"]].melt(id_vars="date", var_name="类型", value_name="金额")
-        st.plotly_chart(px.line(fund_plot, x="date", y="金额", color="类型", title="历史申购/赎回趋势图"), use_container_width=True)
+        fund_plot = view_df[["date", "purchase", "redeem"]].melt(id_vars="date", var_name="类型", value_name="金额")
+        fund_fig = px.line(fund_plot, x="date", y="金额", color="类型", title="历史申购 / 赎回趋势")
+        st.plotly_chart(base_figure(fund_fig), use_container_width=True)
+
+        weekday_df = (
+            view_df.assign(星期=view_df["date"].dt.dayofweek.map({0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}))
+            .groupby("星期", as_index=False)[["purchase", "redeem", "net_flow"]]
+            .mean()
+        )
+        weekday_order = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        weekday_plot = weekday_df.melt("星期", value_vars=["purchase", "redeem"], var_name="类型", value_name="日均金额")
+        weekday_fig = px.bar(
+            weekday_plot, x="星期", y="日均金额", color="类型", barmode="group",
+            category_orders={"星期": weekday_order}, title="星期周期画像"
+        )
+        st.plotly_chart(base_figure(weekday_fig, 350), use_container_width=True)
 
         yield_cols = [c for c in ["mfd_daily_yield", "mfd_7daily_yield"] if c in df.columns]
         if yield_cols:
-            yield_plot = df[["date"] + yield_cols].melt("date", var_name="收益率字段", value_name="数值")
+            yield_plot = view_df[["date"] + yield_cols].melt("date", var_name="收益率字段", value_name="数值")
             st.plotly_chart(px.line(yield_plot, x="date", y="数值", color="收益率字段", title="收益率变化图"), use_container_width=True)
 
         shibor_cols = [c for c in df.columns if c.startswith("Interest_")]
         if shibor_cols:
             chosen_shibor = st.multiselect("选择要展示的 Shibor 指标", shibor_cols, default=shibor_cols[: min(3, len(shibor_cols))])
             if chosen_shibor:
-                shibor_plot = df[["date"] + chosen_shibor].melt("date", var_name="Shibor字段", value_name="利率")
+                shibor_plot = view_df[["date"] + chosen_shibor].melt("date", var_name="Shibor字段", value_name="利率")
                 st.plotly_chart(px.line(shibor_plot, x="date", y="利率", color="Shibor字段", title="Shibor 利率变化图"), use_container_width=True)
+
+        with st.expander("查看与下载当前筛选数据"):
+            st.dataframe(view_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "下载筛选数据 CSV",
+                view_df.to_csv(index=False).encode("utf-8-sig"),
+                "fund_flow_filtered.csv",
+                mime="text/csv",
+            )
 
     profile = read_raw_table("user_profile")
     if profile is None:
@@ -342,46 +570,22 @@ with tab1:
             col3.plotly_chart(px.bar(cons_counts, x="星座", y="人数", title="星座分布"), use_container_width=True)
 
 with tab2:
-    st.subheader("模型训练与评估模块")
-    st.markdown("### 选择模型和参数进行真实训练")
-    st.info("本模块会在页面中真实训练申购模型和赎回模型，并把训练结果保存到当前 Streamlit 会话，用于后续预测对比和误差分析展示。")
-    st.warning("交互训练用于课堂演示和模型/参数对比，结果只保存在当前会话，不覆盖 output/、models/ 或正式提交文件；正式评估结果以主流程滚动预测为准。")
+    st.subheader("正式模型与验证")
+    st.markdown('<p class="section-note">页面只展示当前正式组合模型，不再保留旧版模型切换入口。</p>', unsafe_allow_html=True)
+    st.info(
+        "模型先用多月份滚动回测选择稳定参数，再分别优化申购的月度总量/日内形状和赎回的节假日距离信号；"
+        "最终采用线上验证表现最好的“月度形状申购 + 事件距离赎回”结构。"
+    )
 
-    col1, col2, col3, col4 = st.columns(4)
-    model_name = col1.selectbox("模型", ["RandomForest", "GradientBoosting", "LightGBM"])
-    n_estimators = col2.slider("树数量/训练轮数", min_value=20, max_value=500, value=100, step=20)
-    max_depth = col3.slider("最大深度（0表示不限制/默认）", min_value=0, max_value=20, value=6, step=1)
-    learning_rate = col4.select_slider("学习率", options=[0.001, 0.003, 0.005, 0.01, 0.03, 0.05, 0.1], value=0.03)
-    random_state = st.number_input("随机种子", min_value=0, max_value=9999, value=42, step=1)
-
-    if st.button("训练并更新展示结果", type="primary"):
-        try:
-            with st.spinner("正在训练模型、生成损失曲线和交叉验证结果..."):
-                result, cv_df, loss_df, feature_cols = train_interactive_model(
-                    model_name,
-                    int(n_estimators),
-                    int(max_depth),
-                    float(learning_rate),
-                    int(random_state),
-                    use_log_target=True,
-                )
-            st.session_state["interactive_valid"] = result
-            st.session_state["interactive_cv"] = cv_df
-            st.session_state["interactive_loss"] = loss_df
-            st.session_state["interactive_meta"] = {
-                "model": model_name,
-                "n_estimators": n_estimators,
-                "max_depth": max_depth,
-                "learning_rate": learning_rate,
-                "feature_count": len(feature_cols),
-            }
-            st.success("训练完成，已更新当前会话中的交互训练结果。可在侧边栏切换展示来源。")
-        except Exception as exc:
-            st.error(f"训练失败：{exc}")
+    flow_cols = st.columns(4)
+    flow_cols[0].metric("选参区间", "2014年4—7月")
+    flow_cols[1].metric("独立验证", "2014年8月")
+    flow_cols[2].metric("申购模型", "月度形状")
+    flow_cols[3].metric("赎回模型", "事件距离")
 
     display_valid = get_display_validation(result_source)
     if display_valid is None:
-        st.warning("暂无验证集结果，请先运行完整流程或在本页训练模型。")
+        st.warning("暂无正式组合模型验证结果，请先在左侧运行完整流程。")
     else:
         metrics = evaluate_prediction(display_valid)
         c1, c2, c3, c4 = st.columns(4)
@@ -392,34 +596,74 @@ with tab2:
 
         purchase_plot = display_valid[["date", "purchase_true", "purchase_pred"]].melt("date", var_name="类型", value_name="金额")
         redeem_plot = display_valid[["date", "redeem_true", "redeem_pred"]].melt("date", var_name="类型", value_name="金额")
-        st.plotly_chart(px.line(purchase_plot, x="date", y="金额", color="类型", title=f"申购：真实值 vs 预测值（{result_source}）"), use_container_width=True)
-        st.plotly_chart(px.line(redeem_plot, x="date", y="金额", color="类型", title=f"赎回：真实值 vs 预测值（{result_source}）"), use_container_width=True)
-
-    if "interactive_loss" in st.session_state:
-        st.markdown("### 训练过程损失曲线")
-        loss_df = st.session_state["interactive_loss"]
-        loss_plot = loss_df.melt(["训练轮数/树数", "目标"], value_vars=["训练MAPE", "验证MAPE"], var_name="曲线", value_name="MAPE")
-        st.plotly_chart(px.line(loss_plot, x="训练轮数/树数", y="MAPE", color="曲线", line_dash="目标", markers=True, title="训练过程损失曲线"), use_container_width=True)
-
-    if "interactive_cv" in st.session_state:
-        st.markdown("### 时间序列交叉验证结果")
-        st.dataframe(st.session_state["interactive_cv"], use_container_width=True)
-        cv_plot = st.session_state["interactive_cv"].melt("折数", value_vars=["申购MAPE", "赎回MAPE", "加权MAPE"], var_name="指标", value_name="MAPE")
-        st.plotly_chart(px.bar(cv_plot, x="折数", y="MAPE", color="指标", barmode="group", title="交叉验证 MAPE"), use_container_width=True)
+        left, right = st.columns(2)
+        left.plotly_chart(px.line(purchase_plot, x="date", y="金额", color="类型", title="申购：真实值 vs 正式模型"), use_container_width=True)
+        right.plotly_chart(px.line(redeem_plot, x="date", y="金额", color="类型", title="赎回：真实值 vs 正式模型"), use_container_width=True)
 
 with tab3:
-    st.subheader("预测结果展示模块")
+    st.subheader("预测与资金计划")
+    st.markdown('<p class="section-note">把模型输出转换为可执行的每日资金安排与压力情景。</p>', unsafe_allow_html=True)
     pred = read_csv_if_exists(SUBMISSION_WITH_HEADER_PATH)
     if pred is None:
         st.warning("尚未生成预测结果文件，请先运行：python run_all.py")
     else:
         pred["date"] = pd.to_datetime(pred["report_date"].astype(str))
-        st.markdown("### 未来30天预测结果（2014年9月）")
-        st.dataframe(pred[["report_date", "purchase", "redeem"]], use_container_width=True)
-        pred_plot = pred[["date", "purchase", "redeem"]].melt("date", var_name="类型", value_name="金额")
-        st.plotly_chart(px.line(pred_plot, x="date", y="金额", color="类型", title="2014年9月申购/赎回预测"), use_container_width=True)
+        pred = add_net_flow(pred)
+        st.markdown("### 压力情景")
+        col1, col2, col3 = st.columns([1, 1, 1.4])
+        redeem_stress = col1.slider("赎回压力增幅", 0, 50, 10, 5, format="%d%%")
+        reserve_buffer = col2.slider("准备金安全垫", 0, 30, 10, 5, format="%d%%")
+        col3.info("情景参数只用于资金计划演算，不会修改模型结果或提交文件。")
+
+        plan = pred.copy()
+        plan["stress_redeem"] = plan["redeem"] * (1 + redeem_stress / 100)
+        plan["stress_net_flow"] = plan["purchase"] - plan["stress_redeem"]
+        plan["recommended_reserve"] = plan["stress_redeem"] * (1 + reserve_buffer / 100)
+        plan["risk_level"] = pd.cut(
+            plan["stress_net_flow"],
+            bins=[-np.inf, -5e7, 0, np.inf],
+            labels=["高", "中", "低"],
+        ).astype(str)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("预计总申购", format_amount(plan["purchase"].sum()))
+        k2.metric("压力情景总赎回", format_amount(plan["stress_redeem"].sum()), f"+{redeem_stress}%")
+        k3.metric("最大单日准备金", format_amount(plan["recommended_reserve"].max()))
+        k4.metric("高风险天数", f"{(plan['risk_level'] == '高').sum()} 天")
+
+        pred_plot = plan[["date", "purchase", "redeem", "stress_redeem"]].melt("date", var_name="类型", value_name="金额")
+        pred_fig = px.line(
+            pred_plot,
+            x="date",
+            y="金额",
+            color="类型",
+            title="基准预测与压力情景",
+            color_discrete_map={"purchase": "#0f766e", "redeem": "#f97316", "stress_redeem": "#dc2626"},
+        )
+        st.plotly_chart(base_figure(pred_fig), use_container_width=True)
+
+        st.markdown("### 每日资金计划")
+        plan_display = plan.copy()
+        plan_display["date"] = plan_display["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            plan_display[["date", "purchase", "redeem", "net_flow", "stress_redeem", "recommended_reserve", "risk_level"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "date": "日期",
+                "purchase": st.column_config.NumberColumn("预计申购", format="%d"),
+                "redeem": st.column_config.NumberColumn("预计赎回", format="%d"),
+                "net_flow": st.column_config.NumberColumn("基准净流量", format="%d"),
+                "stress_redeem": st.column_config.NumberColumn("压力赎回", format="%.0f"),
+                "recommended_reserve": st.column_config.NumberColumn("建议准备金", format="%.0f"),
+                "risk_level": st.column_config.TextColumn("风险等级"),
+            },
+        )
         submit_bytes = pred[["report_date", "purchase", "redeem"]].to_csv(index=False, header=False).encode("utf-8-sig")
-        st.download_button("下载天池提交文件（无表头）", submit_bytes, "tc_comp_predict_table.csv")
+        plan_bytes = plan_display.to_csv(index=False).encode("utf-8-sig")
+        d1, d2 = st.columns(2)
+        d1.download_button("下载天池提交文件", submit_bytes, "tc_comp_predict_table.csv", mime="text/csv")
+        d2.download_button("下载资金计划", plan_bytes, "fund_flow_plan.csv", mime="text/csv")
 
     display_valid = get_display_validation(result_source)
     if display_valid is not None:
@@ -431,7 +675,7 @@ with tab3:
         st.dataframe(display_valid[show_cols], use_container_width=True)
 
 with tab4:
-    st.subheader("误差分析模块")
+    st.subheader("误差诊断")
     display_valid = get_display_validation(result_source)
     if display_valid is None:
         st.warning("暂无验证集结果，请先运行完整流程或在模型训练页训练模型。")
