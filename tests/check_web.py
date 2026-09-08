@@ -9,9 +9,13 @@ for page in pages:
  results[page]=[str(e.value) for e in a.exception]
  print(page,results[page])
 a.sidebar.radio[0].set_value('模型训练').run(timeout=45)
-a.button[0].click().run(timeout=60)
+train_button=next(button for button in a.button if button.label=='开始训练与验证')
+train_button.click().run(timeout=60)
 results['交互训练']= [str(e.value) for e in a.exception]
 print('交互训练',results['交互训练'])
+run_all_button=next(button for button in a.button if 'run_all.py' in button.label)
+results['快捷完整流程入口']=[] if run_all_button else ['未找到 run_all.py 按钮']
+print('快捷完整流程入口',results['快捷完整流程入口'])
 event_button=next(button for button in a.button if '运行正式模型' in button.label)
 results['正式模型训练入口']=[] if event_button else ['未找到正式模型按钮']
 print('正式模型训练入口',results['正式模型训练入口'])

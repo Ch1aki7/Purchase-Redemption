@@ -1,11 +1,14 @@
 """资金流入流出预测系统：真实数据、严格时序回测与可追溯预测。"""
 import json
+import os
+import subprocess
+import sys
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import streamlit as st
 from src.config import (
-    PROCESSED_DATA_DIR, OUTPUT_DIR, MODEL_DIR, TARGETS, FOLDS,
+    ROOT, PROCESSED_DATA_DIR, OUTPUT_DIR, MODEL_DIR, TARGETS, FOLDS,
     EVENT_DISTANCE_MANIFEST_PATH, EVENT_DISTANCE_PURCHASE_ONLY_PATH,
     EVENT_DISTANCE_REDEEM_ONLY_PATH, C3_EVENT_DISTANCE_VALIDATION_PATH,
 )
@@ -72,10 +75,39 @@ def weight_table(weights):
 
 st.sidebar.title('资金流预测 · 分析台')
 page=st.sidebar.radio('功能导航',['首页 / 项目概览','数据探索','特征分析','模型训练','模型评估','滚动回测','未来预测','误差分析'])
+run_all_clicked=st.sidebar.button(
+    '▶ 运行 run_all.py',key='run_all_shortcut',width='stretch',
+    help='重新执行预处理、特征、回测、训练和未来预测',
+)
+st.sidebar.divider()
 st.sidebar.caption('历史：2013.07.01 — 2014.08.31\n\n目标：2014.09.01 — 2014.09.30')
 st.sidebar.info('所有金额保留原始数据单位。指导书未说明单位换算，系统不擅自换算为元。')
-d=table('daily_balance.csv',True); d['date']=pd.to_datetime(d.date); d=d.set_index('date')
+
 st.title(page)
+if run_all_clicked:
+    with st.status('正在运行完整数据与模型流程…',expanded=True) as run_status:
+        run_status.write('执行预处理 → 特征校验 → 回测 → 正式训练 → 九月预测')
+        process=subprocess.run(
+            [sys.executable,str(ROOT/'run_all.py')],cwd=ROOT,
+            capture_output=True,text=True,encoding='utf-8',errors='replace',
+            env={**os.environ,'PYTHONIOENCODING':'utf-8'},
+        )
+        if process.returncode:
+            run_status.update(label='run_all.py 运行失败',state='error',expanded=True)
+            if process.stdout.strip():
+                st.code(process.stdout,language='text')
+            if process.stderr.strip():
+                st.code(process.stderr,language='text')
+            st.error(f'完整流程退出码：{process.returncode}')
+            st.stop()
+        run_status.update(label='run_all.py 已运行完成',state='complete',expanded=False)
+    read_csv.clear();read_submission.clear()
+    st.success('数据、模型和九月预测已重新生成。')
+    if process.stdout.strip():
+        with st.expander('查看 run_all.py 输出'):
+            st.code(process.stdout,language='text')
+
+d=table('daily_balance.csv',True); d['date']=pd.to_datetime(d.date); d=d.set_index('date')
 
 if page=='首页 / 项目概览':
     st.markdown('### 资金流入流出预测系统')
